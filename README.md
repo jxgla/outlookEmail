@@ -33,8 +33,10 @@
 - 🗑️ **邮件删除** - 单封/批量永久删除邮件
 - 🔄 **API 优先级回退** - Graph API → IMAP(新) → IMAP(旧) 自动回退
 - 🔑 **对外 API** - 通过 API Key 直接获取邮件，无需登录
-- 🧩 **注册 / 邮箱池 API** - 覆盖 `health`、`capabilities`、`messages`、`verification-code`、`verification-link`、`wait-message`、`pool claim/release/complete/stats`
+- 🧩 **注册 / 邮箱池 API** - 覆盖 `health`、`capabilities`、`messages`、`verification-code`、`verification-link`、`wait-message`、`pool claim/release/complete/stats/groups`
+- 🗂️ **分组下钻 API** - 支持查询全部分组摘要，或按分组查看组内账号列表，便于“指定分组 → 枚举邮箱 → 提 OTP”
 - 📊 **邮箱池面板** - 页面端可直接查看池统计、当前邮箱池状态，并支持快捷切换状态
+- 🔢 **快捷提取验证码** - 邮箱操作行内提供「提取验证码」按钮，自动比较 `inbox` / `junkemail` 最新邮件并复制验证码
 
 #### Token 刷新管理
 - 🔁 **全量刷新** - 一键刷新所有账号 Token
@@ -201,10 +203,26 @@ user@outlook.com----password123----24d9a0ed-8787-4584-883c-2fd79308940a----0.AXE
 6. 点击邮件查看详情（支持 HTML 渲染）
 7. 点击「🔍 全屏查看」按钮查看完整邮件内容
 
+**快捷提取验证码：**
+- 在邮箱列表每一行的「复制 / 提取验证码 / 停用 / 编辑 / 删除」操作区中，可直接点击「提取验证码」
+- 页面端会自动比较该邮箱 `inbox` 与 `junkemail` 各自最新一封匹配邮件，选择时间更新的一封提取验证码
+- 提取成功后会自动复制到剪贴板，并提示验证码来源文件夹
+
 ### 4. 对外 API / 注册邮箱池接口
 
 通过 API Key 直接获取邮件、提取验证码/验证链接、等待新邮件，并支持邮箱池领取 / 释放 / 回传结果。
 其中验证码提取会自动比较 `inbox` 与 `junkemail` 各自最新一封匹配邮件，再从更新的一封里返回验证码。
+
+**验证码提取规则：**
+- 页面端按钮和 `/api/external/verification-code` 使用同一套提取逻辑，避免页面与接口结果不一致
+- 会分别读取 `inbox` 与 `junkemail` 各自最新一封匹配邮件，再比较时间，选择更新的一封提取验证码
+- 如果传入 `since_minutes`，会按该时间窗口筛选；如果不传，则不会默认限制最近 10 分钟
+- 页面端快捷提码使用内部接口 `GET /api/accounts/<account_id>/latest-verification-code`
+
+**分组下钻接口：**
+- `GET /api/external/pool/groups` 可获取全部分组摘要
+- `GET /api/external/pool/groups?group_id=<id>` 或 `group_name=<name>` 可获取指定分组信息
+- 指定分组时默认会返回该分组下的账号列表，适合先枚举该组邮箱，再逐个调用 OTP/邮件接口
 
 **配置步骤：**
 1. 点击「⚙️ 设置」→ 在「对外 API Key」处点击「🔑 随机生成」→ 保存
@@ -219,6 +237,14 @@ curl -H "X-API-Key: your-api-key" \
 curl -X POST -H "Content-Type: application/json" -H "X-API-Key: your-api-key" \
   -d '{"caller_id":"worker-01","task_id":"task-001","provider":"outlook"}' \
   "http://localhost:5000/api/external/pool/claim-random"
+
+# 获取全部分组摘要
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/pool/groups"
+
+# 获取指定分组详情及组内账号
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/pool/groups?group_id=2"
 
 # 提取验证码（自动比较 inbox 与 junkemail 最新一封）
 curl -H "X-API-Key: your-api-key" \

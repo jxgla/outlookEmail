@@ -22,6 +22,7 @@
 - `pool/claim-release`
 - `pool/claim-complete`
 - `pool/stats`
+- `pool/groups`
 
 ---
 
@@ -123,6 +124,7 @@ X-API-Key: YOUR_API_KEY
 | POST | `/api/external/pool/claim-release` | 释放已领取邮箱 |
 | POST | `/api/external/pool/claim-complete` | 回传注册结果 |
 | GET | `/api/external/pool/stats` | 查看池状态统计 |
+| GET | `/api/external/pool/groups` | 查看分组摘要或指定分组下账号 |
 
 ### 兼容旧接口
 
@@ -475,6 +477,70 @@ curl -H "X-API-Key: YOUR_API_KEY" \
 - `pool_counts.frozen`
 - `pool_counts.retired`
 
+### GET /api/external/pool/groups
+
+用途：
+
+- 不带参数时，返回全部分组摘要
+- 传 `group_id` 或 `group_name` 时，返回指定分组信息
+- 指定分组时默认会一并返回该分组下的账号列表，适合“指定分组 → 枚举邮箱 → 提 OTP”流程
+
+查询参数：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | integer | 否 | 分组 ID，和 `group_name` 二选一 |
+| `group_name` | string | 否 | 分组名称，和 `group_id` 二选一 |
+| `include_accounts` | boolean | 否 | 仅在指定分组时生效；默认 `true`，传 `false` 可只看分组摘要 |
+
+返回字段：
+
+- 列表模式返回 `groups`
+- 指定分组模式返回 `group`
+- 分组对象包含：
+  - `group_id`
+  - `name`
+  - `description`
+  - `color`
+  - `is_system`
+  - `proxy_configured`
+  - `account_count`
+  - `pool_counts`
+- 当 `include_accounts=true` 时，还会返回 `accounts`
+
+账号对象包含：
+
+- `account_id`
+- `email`
+- `status`
+- `group_id`
+- `group_name`
+- `group_color`
+- `remark`
+- `last_refresh_at`
+- `provider`
+- `pool_status`
+- `pool_claim_token`
+- `pool_claimed_by`
+- `pool_task_id`
+- `pool_claimed_at`
+- `pool_lease_expires_at`
+- `pool_cooldown_until`
+- `pool_last_result`
+- `pool_last_detail`
+
+示例：
+
+```bash
+# 获取全部分组摘要
+curl -H "X-API-Key: YOUR_API_KEY" \
+  "http://localhost:5000/api/external/pool/groups"
+
+# 获取指定分组详情及组内账号
+curl -H "X-API-Key: YOUR_API_KEY" \
+  "http://localhost:5000/api/external/pool/groups?group_id=2"
+```
+
 ### 租约超时行为
 
 当前实现里，领取后如果长时间未回传，不会直接回到 `available`。
@@ -648,6 +714,7 @@ socks5://user:pass@proxy.example.com:1080
 | `FEATURE_DISABLED` | 邮箱池接口已被关闭 |
 | `INVALID_PARAM` | 参数错误 |
 | `ACCOUNT_NOT_FOUND` | 账号不存在 |
+| `GROUP_NOT_FOUND` | 指定分组不存在 |
 | `ACCOUNT_ACCESS_FORBIDDEN` | 账号存在但当前不可读 |
 | `MAIL_NOT_FOUND` | 未找到匹配邮件 |
 | `VERIFICATION_CODE_NOT_FOUND` | 未提取到验证码 |

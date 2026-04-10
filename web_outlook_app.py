@@ -1007,6 +1007,16 @@ def get_group_by_id(group_id: int) -> Optional[Dict]:
     return dict(row) if row else None
 
 
+def get_group_by_name(group_name: str) -> Optional[Dict]:
+    """根据名称获取分组"""
+    if not group_name:
+        return None
+    db = get_db()
+    cursor = db.execute('SELECT * FROM groups WHERE name = ?', (group_name,))
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
 def add_group(name: str, description: str = '', color: str = '#1a1a1a', proxy_url: str = '') -> Optional[int]:
     """添加分组"""
     db = get_db()
@@ -1414,6 +1424,23 @@ def get_pool_counts() -> Dict[str, int]:
     return counts
 
 
+def get_group_pool_counts(group_id: int) -> Dict[str, int]:
+    """统计指定分组下邮箱池各状态数量。"""
+    refresh_pool_states()
+    db = get_db()
+    rows = db.execute('''
+        SELECT pool_status, COUNT(*) AS count
+        FROM accounts
+        WHERE group_id = ?
+        GROUP BY pool_status
+    ''', (group_id,)).fetchall()
+
+    counts = {status: 0 for status in DEFAULT_POOL_STATES}
+    for row in rows:
+        counts[row['pool_status'] or 'available'] = row['count']
+    return counts
+
+
 def set_account_pool_state(
     account_id: int,
     pool_status: str,
@@ -1546,6 +1573,39 @@ def serialize_account_pool(account: Dict[str, Any]) -> Dict[str, Any]:
     snapshot['account_id'] = account.get('id')
     snapshot['status'] = account.get('status', 'active')
     return snapshot
+
+
+def serialize_external_group_account(account: Dict[str, Any]) -> Dict[str, Any]:
+    """序列化对外分组详情中的账号字段。"""
+    return {
+        'account_id': account.get('id'),
+        'email': account.get('email', ''),
+        'status': account.get('status', 'active'),
+        'group_id': account.get('group_id'),
+        'group_name': account.get('group_name', '默认分组'),
+        'group_color': account.get('group_color', '#666666'),
+        'remark': account.get('remark', ''),
+        'last_refresh_at': to_iso8601(account.get('last_refresh_at')),
+        **serialize_account_pool(account)
+    }
+
+
+def serialize_external_pool_group(group: Dict[str, Any], include_accounts: bool = False) -> Dict[str, Any]:
+    """序列化对外邮箱池分组信息。"""
+    payload = {
+        'group_id': group.get('id'),
+        'name': group.get('name', ''),
+        'description': group.get('description', ''),
+        'color': group.get('color', '#1a1a1a'),
+        'is_system': bool(group.get('is_system')),
+        'proxy_configured': bool(group.get('proxy_url')),
+        'account_count': get_group_account_count(group.get('id')),
+        'pool_counts': get_group_pool_counts(group.get('id')),
+    }
+    if include_accounts:
+        accounts = load_accounts(group.get('id'))
+        payload['accounts'] = [serialize_external_group_account(account) for account in accounts]
+    return payload
 
 
 # ==================== 工具函数 ====================
@@ -5920,7 +5980,8 @@ def api_external_capabilities():
             'pool_claim_random',
             'pool_claim_release',
             'pool_claim_complete',
-            'pool_stats'
+            'pool_stats',
+            'pool_groups'
         ])
 
     restricted_features = []
@@ -5929,7 +5990,8 @@ def api_external_capabilities():
             'pool_claim_random',
             'pool_claim_release',
             'pool_claim_complete',
-            'pool_stats'
+            'pool_stats',
+            'pool_groups'
         ])
 
     return external_success({
@@ -6389,6 +6451,34 @@ def api_external_pool_stats():
         return external_error('FEATURE_DISABLED', '邮箱池外部接口已禁用', 403)
     return external_success({
         'pool_counts': get_pool_counts()
+    })
+
+
+@app.route('/api/external/pool/groups', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_pool_groups():
+    """获取邮箱池分组摘要，或指定分组下的账号详情。"""
+    if not is_pool_external_enabled():
+        return external_error('FEATURE_DISABLED', '邮箱池外部接口已被关闭', 403)
+
+    group_id = request.args.get('group_id', type=int)
+    group_name = request.args.get('group_name', '').strip()
+    include_accounts_raw = request.args.get('include_accounts', '').strip().lower()
+
+    if group_id is not None or group_name:
+        group = get_group_by_id(group_id) if group_id is not None else get_group_by_name(group_name)
+        if not group:
+            return external_error('GROUP_NOT_FOUND', '指定分组不存在', 404)
+
+        include_accounts = True if include_accounts_raw == '' else include_accounts_raw in ('1', 'true', 'yes', 'on')
+        return external_success({
+            'group': serialize_external_pool_group(group, include_accounts=include_accounts)
+        })
+
+    groups = [serialize_external_pool_group(group, include_accounts=False) for group in load_groups()]
+    return external_success({
+        'groups': groups
     })
 
 
