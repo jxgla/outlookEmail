@@ -1,5 +1,47 @@
 # 📋 更新日志
 
+## 2026-04-10 - 注册 / 邮箱池 API 覆盖补齐
+
+### 新增功能
+- 🧩 **注册 / 邮箱池对外接口覆盖** - 新增并统一 `/api/external/*` 下的健康检查、能力探测、账号状态、邮件摘要、最新邮件、邮件详情、原始内容、验证码、验证链接、等待新邮件、异步 probe、邮箱池领取 / 释放 / 回传 / 统计
+- 📦 **邮箱池状态模型** - 账号新增 `available / claimed / used / cooldown / frozen / retired` 六种池状态，支持租约与冷却时间
+- 🖥️ **页面端邮箱池面板** - 在邮箱下方面板新增池统计、当前账号池状态、接口示例、快捷切换状态
+- ⚙️ **邮箱池设置项** - 设置页新增外部邮箱池接口开关、默认租约时长、冷却时长
+
+### 数据库变更
+- `accounts` 表新增：
+  - `provider`
+  - `pool_status`
+  - `pool_claim_token`
+  - `pool_claimed_by`
+  - `pool_task_id`
+  - `pool_claimed_at`
+  - `pool_lease_expires_at`
+  - `pool_cooldown_until`
+  - `pool_last_result`
+  - `pool_last_detail`
+
+### API 变更
+- 新增 `GET /api/external/health`
+- 新增 `GET /api/external/capabilities`
+- 新增 `GET /api/external/account-status`
+- 新增 `GET /api/external/messages`
+- 新增 `GET /api/external/messages/latest`
+- 新增 `GET /api/external/messages/{message_id}`
+- 新增 `GET /api/external/messages/{message_id}/raw`
+- 新增 `GET /api/external/verification-code`
+- 新增 `GET /api/external/verification-link`
+- 新增 `GET /api/external/wait-message`
+- 新增 `GET /api/external/probe/{probe_id}`
+- 新增 `POST /api/external/pool/claim-random`
+- 新增 `POST /api/external/pool/claim-release`
+- 新增 `POST /api/external/pool/claim-complete`
+- 新增 `GET /api/external/pool/stats`
+- 新增 `GET /api/pool/stats`
+- 新增 `POST /api/accounts/{id}/pool-state`
+
+---
+
 ## 2026-02-24 - DuckMail 临时邮箱集成
 
 ### 新增功能
