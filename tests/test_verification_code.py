@@ -24,6 +24,42 @@ ACTIVE_ACCOUNT = {
     "status": "active",
 }
 
+GROUP_RECORD = {
+    "id": 2,
+    "name": "注册组",
+    "description": "用于注册流程",
+    "color": "#123456",
+    "is_system": 0,
+    "proxy_url": "",
+}
+
+GROUP_ACCOUNTS = [
+    {
+        "id": 11,
+        "email": "group-a@outlook.com",
+        "status": "active",
+        "group_id": 2,
+        "group_name": "注册组",
+        "group_color": "#123456",
+        "remark": "A",
+        "provider": "outlook",
+        "pool_status": "available",
+        "last_refresh_at": "2026-04-10T10:10:00+00:00",
+    },
+    {
+        "id": 12,
+        "email": "group-b@outlook.com",
+        "status": "inactive",
+        "group_id": 2,
+        "group_name": "注册组",
+        "group_color": "#123456",
+        "remark": "B",
+        "provider": "outlook",
+        "pool_status": "retired",
+        "last_refresh_at": "2026-04-10T10:20:00+00:00",
+    },
+]
+
 
 def mock_read_account_messages(account, folder="inbox", **kwargs):
     messages = {
@@ -121,6 +157,61 @@ class LatestVerificationCodeTests(unittest.TestCase):
         self.assertEqual(payload["data"]["code"], "654321")
         self.assertEqual(payload["data"]["selected_folder"], "junkemail")
         self.assertEqual(since_minutes_seen, [("inbox", None), ("junkemail", None)])
+
+    def test_external_pool_groups_returns_group_detail_with_accounts(self):
+        with patch.object(app_module, "get_external_api_key", return_value="test-key"), \
+             patch.object(app_module, "is_pool_external_enabled", return_value=True), \
+             patch.object(app_module, "get_group_by_id", return_value=GROUP_RECORD), \
+             patch.object(app_module, "get_group_account_count", return_value=2), \
+             patch.object(app_module, "get_group_pool_counts", return_value={
+                 "available": 1,
+                 "claimed": 0,
+                 "used": 0,
+                 "cooldown": 0,
+                 "frozen": 0,
+                 "retired": 1,
+             }), \
+             patch.object(app_module, "load_accounts", return_value=GROUP_ACCOUNTS):
+            response = self.client.get(
+                "/api/external/pool/groups?group_id=2",
+                headers={"X-API-Key": "test-key"},
+            )
+
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["data"]["group"]["group_id"], 2)
+        self.assertEqual(payload["data"]["group"]["account_count"], 2)
+        self.assertEqual(len(payload["data"]["group"]["accounts"]), 2)
+        self.assertEqual(payload["data"]["group"]["accounts"][0]["email"], "group-a@outlook.com")
+        self.assertEqual(payload["data"]["group"]["accounts"][1]["pool_status"], "retired")
+
+    def test_external_pool_groups_returns_group_summaries_without_accounts_by_default(self):
+        with patch.object(app_module, "get_external_api_key", return_value="test-key"), \
+             patch.object(app_module, "is_pool_external_enabled", return_value=True), \
+             patch.object(app_module, "load_groups", return_value=[GROUP_RECORD]), \
+             patch.object(app_module, "get_group_account_count", return_value=2), \
+             patch.object(app_module, "get_group_pool_counts", return_value={
+                 "available": 1,
+                 "claimed": 0,
+                 "used": 0,
+                 "cooldown": 0,
+                 "frozen": 0,
+                 "retired": 1,
+             }):
+            response = self.client.get(
+                "/api/external/pool/groups",
+                headers={"X-API-Key": "test-key"},
+            )
+
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(len(payload["data"]["groups"]), 1)
+        self.assertEqual(payload["data"]["groups"][0]["group_id"], 2)
+        self.assertNotIn("accounts", payload["data"]["groups"][0])
 
 
 if __name__ == "__main__":
