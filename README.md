@@ -32,7 +32,9 @@
 - 📦 **批量移动分组** - 批量选择邮箱移动到指定分组
 - 🗑️ **邮件删除** - 单封/批量永久删除邮件
 - 🔄 **API 优先级回退** - Graph API → IMAP(新) → IMAP(旧) 自动回退
-- 🔑 **对外 API** - 通过 API Key 直接获取邮件，无需登录（⭐ 新增 2026年02月23日23:52:46）
+- 🔑 **对外 API** - 通过 API Key 直接获取邮件，无需登录
+- 🧩 **注册 / 邮箱池 API** - 覆盖 `health`、`capabilities`、`messages`、`verification-code`、`verification-link`、`wait-message`、`pool claim/release/complete/stats`
+- 📊 **邮箱池面板** - 页面端可直接查看池统计、当前邮箱池状态，并支持快捷切换状态
 
 #### Token 刷新管理
 - 🔁 **全量刷新** - 一键刷新所有账号 Token
@@ -199,15 +201,29 @@ user@outlook.com----password123----24d9a0ed-8787-4584-883c-2fd79308940a----0.AXE
 6. 点击邮件查看详情（支持 HTML 渲染）
 7. 点击「🔍 全屏查看」按钮查看完整邮件内容
 
-### 4. 对外 API（⭐ 新增）
+### 4. 对外 API / 注册邮箱池接口
 
-通过 API Key 直接获取邮件，无需登录 Web 界面。
+通过 API Key 直接获取邮件、提取验证码/验证链接、等待新邮件，并支持邮箱池领取 / 释放 / 回传结果。
 
 **配置步骤：**
 1. 点击「⚙️ 设置」→ 在「对外 API Key」处点击「🔑 随机生成」→ 保存
 
-**调用示例：**
+**常用示例：**
 ```bash
+# 健康检查
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/health"
+
+# 领取邮箱
+curl -X POST -H "Content-Type: application/json" -H "X-API-Key: your-api-key" \
+  -d '{"caller_id":"worker-01","task_id":"task-001","provider":"outlook"}' \
+  "http://localhost:5000/api/external/pool/claim-random"
+
+# 提取验证码
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/verification-code?email=user@outlook.com&subject_contains=verify"
+
+# 兼容旧接口：直接获取邮件列表
 curl -H "X-API-Key: your-api-key" \
   "http://localhost:5000/api/external/emails?email=user@outlook.com&folder=inbox"
 ```

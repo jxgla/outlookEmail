@@ -16,14 +16,16 @@ import secrets
 import time
 import json
 import re
+import threading
 import uuid
 import bcrypt
 import base64
 import html
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from email.header import decode_header
+from email.utils import parsedate_to_datetime
 from typing import Optional, List, Dict, Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from flask import Flask, render_template, request, jsonify, g, session, redirect, url_for, Response, make_response
 from functools import wraps
 import requests
@@ -125,6 +127,27 @@ OAUTH_SCOPES = [
     "https://graph.microsoft.com/Mail.ReadWrite",
     "https://graph.microsoft.com/User.Read"
 ]
+
+APP_VERSION = "2026.04.external-api"
+EXTERNAL_MAX_MESSAGES = 50
+DEFAULT_VERIFICATION_LOOKBACK_MINUTES = 10
+DEFAULT_POOL_PROVIDER = "outlook"
+DEFAULT_POOL_STATES = ("available", "claimed", "used", "cooldown", "frozen", "retired")
+WAIT_PROBE_STATES = ("pending", "matched", "timeout", "error")
+POOL_RESULT_STATE_MAP = {
+    "success": "used",
+    "verification_timeout": "cooldown",
+    "provider_blocked": "frozen",
+    "credential_invalid": "retired",
+    "network_error": "available",
+}
+LINK_KEYWORDS = (
+    "verify", "verification", "activate", "activation", "confirm", "signup",
+    "sign-up", "magic", "login", "one-time", "reset", "approve",
+    "验证", "激活", "确认", "登录"
+)
+
+wait_message_probes: Dict[str, Dict[str, Any]] = {}
 
 
 # ==================== 登录速率限制 ====================
@@ -525,6 +548,26 @@ def init_db():
         cursor.execute('ALTER TABLE accounts ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
     if 'last_refresh_at' not in columns:
         cursor.execute('ALTER TABLE accounts ADD COLUMN last_refresh_at TIMESTAMP')
+    if 'provider' not in columns:
+        cursor.execute(f"ALTER TABLE accounts ADD COLUMN provider TEXT DEFAULT '{DEFAULT_POOL_PROVIDER}'")
+    if 'pool_status' not in columns:
+        cursor.execute("ALTER TABLE accounts ADD COLUMN pool_status TEXT DEFAULT 'available'")
+    if 'pool_claim_token' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN pool_claim_token TEXT')
+    if 'pool_claimed_by' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN pool_claimed_by TEXT')
+    if 'pool_task_id' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN pool_task_id TEXT')
+    if 'pool_claimed_at' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN pool_claimed_at TIMESTAMP')
+    if 'pool_lease_expires_at' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN pool_lease_expires_at TIMESTAMP')
+    if 'pool_cooldown_until' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN pool_cooldown_until TIMESTAMP')
+    if 'pool_last_result' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN pool_last_result TEXT')
+    if 'pool_last_detail' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN pool_last_detail TEXT')
     
     # 检查 groups 表是否有 is_system 列
     cursor.execute("PRAGMA table_info(groups)")
@@ -621,6 +664,36 @@ def init_db():
         VALUES ('enable_scheduled_refresh', 'true')
     ''')
 
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('pool_external_enabled', 'true')
+    ''')
+
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('pool_default_lease_seconds', '600')
+    ''')
+
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('pool_cooldown_seconds', '86400')
+    ''')
+
+    cursor.execute(f'''
+        UPDATE accounts
+        SET provider = '{DEFAULT_POOL_PROVIDER}'
+        WHERE provider IS NULL OR TRIM(provider) = ''
+    ''')
+
+    cursor.execute('''
+        UPDATE accounts
+        SET pool_status = CASE
+            WHEN status = 'inactive' THEN 'retired'
+            ELSE 'available'
+        END
+        WHERE pool_status IS NULL OR TRIM(pool_status) = ''
+    ''')
+
     # 创建索引以优化查询性能
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_accounts_last_refresh_at
@@ -635,6 +708,21 @@ def init_db():
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_account_refresh_logs_account_id
         ON account_refresh_logs(account_id)
+    ''')
+
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_accounts_pool_status
+        ON accounts(pool_status)
+    ''')
+
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_accounts_pool_lease_expires_at
+        ON accounts(pool_lease_expires_at)
+    ''')
+
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_accounts_pool_cooldown_until
+        ON accounts(pool_cooldown_until)
     ''')
 
     # 迁移现有明文数据为加密数据
@@ -767,6 +855,132 @@ def get_duckmail_api_key() -> str:
     """获取 DuckMail API Key（优先从数据库读取）"""
     api_key = get_setting('duckmail_api_key')
     return api_key if api_key else DUCKMAIL_API_KEY
+
+
+def get_setting_bool(key: str, default: bool = False) -> bool:
+    """读取布尔配置。"""
+    value = get_setting(key)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def get_setting_int(key: str, default: int) -> int:
+    """读取整型配置。"""
+    value = get_setting(key)
+    if value is None or str(value).strip() == '':
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def utc_now() -> datetime:
+    """返回带时区的 UTC 当前时间。"""
+    return datetime.now(timezone.utc)
+
+
+def format_db_datetime(value: Optional[datetime] = None) -> str:
+    """格式化为 SQLite 友好的 UTC 时间字符串。"""
+    dt = value or utc_now()
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def parse_datetime_value(value: Any) -> Optional[datetime]:
+    """尽量解析常见时间格式。"""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(value, tz=timezone.utc)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            try:
+                dt = parsedate_to_datetime(text)
+            except (TypeError, ValueError, IndexError):
+                for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f'):
+                    try:
+                        dt = datetime.strptime(text, fmt)
+                        break
+                    except ValueError:
+                        dt = None
+                if dt is None:
+                    return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def to_iso8601(value: Any) -> str:
+    """将时间值统一转为 ISO 8601 UTC 字符串。"""
+    dt = parse_datetime_value(value)
+    if not dt:
+        return ''
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def mask_secret(value: str, keep: int = 4) -> str:
+    """对敏感值做简单脱敏。"""
+    if not value:
+        return ''
+    if len(value) <= keep * 2:
+        return '*' * len(value)
+    return f"{value[:keep]}***{value[-keep:]}"
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    """将任意值安全转为 int。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def external_success(data: Any = None, message: str = 'success', code: str = 'OK', status: int = 200):
+    """统一的对外 API 成功响应。"""
+    return jsonify({
+        'success': True,
+        'code': code,
+        'message': message,
+        'data': data if data is not None else {}
+    }), status
+
+
+def external_error(code: str, message: str, status: int = 400, data: Any = None):
+    """统一的对外 API 失败响应。"""
+    return jsonify({
+        'success': False,
+        'code': code,
+        'message': message,
+        'data': data
+    }), status
+
+
+def normalize_account_provider(email_addr: str, fallback: str = DEFAULT_POOL_PROVIDER) -> str:
+    """根据邮箱域名粗略推断 provider。"""
+    if not email_addr or '@' not in email_addr:
+        return fallback
+
+    domain = email_addr.split('@', 1)[1].strip().lower()
+    provider_map = {
+        'outlook.com': 'outlook',
+        'hotmail.com': 'outlook',
+        'live.com': 'outlook',
+        'live.cn': 'outlook',
+    }
+    return provider_map.get(domain, fallback)
 
 
 # ==================== 分组操作 ====================
@@ -1013,11 +1227,12 @@ def add_account(email_addr: str, password: str, client_id: str, refresh_token: s
         # 加密敏感字段
         encrypted_password = encrypt_data(password) if password else password
         encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else refresh_token
+        provider = normalize_account_provider(email_addr)
 
         db.execute('''
-            INSERT INTO accounts (email, password, client_id, refresh_token, group_id, remark)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, remark))
+            INSERT INTO accounts (email, password, client_id, refresh_token, group_id, remark, provider, pool_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'available')
+        ''', (email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, remark, provider))
         db.commit()
         return True
     except sqlite3.IntegrityError:
@@ -1032,13 +1247,27 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
         # 加密敏感字段
         encrypted_password = encrypt_data(password) if password else password
         encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else refresh_token
+        provider = normalize_account_provider(email_addr)
+        pool_status_sql = """
+            CASE
+                WHEN ? = 'inactive' AND pool_status NOT IN ('used', 'retired') THEN 'retired'
+                WHEN ? = 'active' AND pool_status = 'retired' THEN 'available'
+                ELSE pool_status
+            END
+        """
 
         db.execute('''
             UPDATE accounts
             SET email = ?, password = ?, client_id = ?, refresh_token = ?,
-                group_id = ?, remark = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+                group_id = ?, remark = ?, status = ?, provider = ?,
+                pool_status = ''' + pool_status_sql + ''',
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-        ''', (email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, remark, status, account_id))
+        ''', (
+            email_addr, encrypted_password, client_id, encrypted_refresh_token,
+            group_id, remark, status, provider,
+            status, status, account_id
+        ))
         db.commit()
         return True
     except Exception:
@@ -1065,6 +1294,258 @@ def delete_account_by_email(email_addr: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def get_pool_default_lease_seconds() -> int:
+    """获取邮箱池默认租约时长。"""
+    return max(30, get_setting_int('pool_default_lease_seconds', 600))
+
+
+def get_pool_cooldown_seconds() -> int:
+    """获取邮箱池默认冷却时长。"""
+    return max(60, get_setting_int('pool_cooldown_seconds', 86400))
+
+
+def is_pool_external_enabled() -> bool:
+    """邮箱池外部接口总开关。"""
+    return get_setting_bool('pool_external_enabled', True)
+
+
+def build_account_pool_snapshot(account: Dict[str, Any]) -> Dict[str, Any]:
+    """提取账号的邮箱池状态快照。"""
+    provider = account.get('provider') or normalize_account_provider(account.get('email', ''))
+    return {
+        'provider': provider,
+        'pool_status': account.get('pool_status') or ('retired' if account.get('status') == 'inactive' else 'available'),
+        'pool_claim_token': account.get('pool_claim_token') or '',
+        'pool_claimed_by': account.get('pool_claimed_by') or '',
+        'pool_task_id': account.get('pool_task_id') or '',
+        'pool_claimed_at': to_iso8601(account.get('pool_claimed_at')),
+        'pool_lease_expires_at': to_iso8601(account.get('pool_lease_expires_at')),
+        'pool_cooldown_until': to_iso8601(account.get('pool_cooldown_until')),
+        'pool_last_result': account.get('pool_last_result') or '',
+        'pool_last_detail': account.get('pool_last_detail') or '',
+    }
+
+
+def refresh_pool_states() -> None:
+    """收敛邮箱池状态，处理租约过期和冷却恢复。"""
+    db = get_db()
+    now = utc_now()
+    cooldown_seconds = get_pool_cooldown_seconds()
+    rows = db.execute('''
+        SELECT id, status, pool_status, pool_lease_expires_at, pool_cooldown_until
+        FROM accounts
+        WHERE pool_status IN ('claimed', 'cooldown')
+           OR status = 'inactive'
+    ''').fetchall()
+
+    changed = False
+    for row in rows:
+        account = dict(row)
+        updates = {}
+        pool_status = account.get('pool_status') or 'available'
+
+        if account.get('status') == 'inactive' and pool_status not in ('retired', 'used'):
+            updates.update({
+                'pool_status': 'retired',
+                'pool_claim_token': None,
+                'pool_claimed_by': None,
+                'pool_task_id': None,
+                'pool_claimed_at': None,
+                'pool_lease_expires_at': None,
+                'pool_cooldown_until': None,
+                'pool_last_result': 'inactive',
+                'pool_last_detail': '账号已停用，自动从邮箱池退役',
+            })
+        elif pool_status == 'claimed':
+            lease_expires_at = parse_datetime_value(account.get('pool_lease_expires_at'))
+            if lease_expires_at and lease_expires_at <= now:
+                updates.update({
+                    'pool_status': 'cooldown',
+                    'pool_claim_token': None,
+                    'pool_claimed_by': None,
+                    'pool_task_id': None,
+                    'pool_claimed_at': None,
+                    'pool_lease_expires_at': None,
+                    'pool_cooldown_until': format_db_datetime(now + timedelta(seconds=cooldown_seconds)),
+                    'pool_last_result': 'lease_timeout',
+                    'pool_last_detail': '租约超时后自动进入冷却状态',
+                })
+        elif pool_status == 'cooldown':
+            cooldown_until = parse_datetime_value(account.get('pool_cooldown_until'))
+            if cooldown_until and cooldown_until <= now:
+                updates.update({
+                    'pool_status': 'available',
+                    'pool_claim_token': None,
+                    'pool_claimed_by': None,
+                    'pool_task_id': None,
+                    'pool_claimed_at': None,
+                    'pool_lease_expires_at': None,
+                    'pool_cooldown_until': None,
+                    'pool_last_result': 'cooldown_completed',
+                })
+
+        if updates:
+            assignments = ', '.join(f"{key} = ?" for key in updates)
+            db.execute(
+                f"UPDATE accounts SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                list(updates.values()) + [account['id']]
+            )
+            changed = True
+
+    if changed:
+        db.commit()
+
+
+def get_pool_counts() -> Dict[str, int]:
+    """统计邮箱池各状态数量。"""
+    refresh_pool_states()
+    db = get_db()
+    rows = db.execute('''
+        SELECT pool_status, COUNT(*) AS count
+        FROM accounts
+        GROUP BY pool_status
+    ''').fetchall()
+
+    counts = {status: 0 for status in DEFAULT_POOL_STATES}
+    for row in rows:
+        counts[row['pool_status'] or 'available'] = row['count']
+    return counts
+
+
+def set_account_pool_state(
+    account_id: int,
+    pool_status: str,
+    detail: str = '',
+    result: str = '',
+    claim_token: Optional[str] = None,
+    caller_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    lease_expires_at: Optional[str] = None,
+    cooldown_until: Optional[str] = None
+) -> bool:
+    """统一更新账号邮箱池状态。"""
+    if pool_status not in DEFAULT_POOL_STATES:
+        return False
+
+    db = get_db()
+    try:
+        db.execute('''
+            UPDATE accounts
+            SET pool_status = ?,
+                pool_claim_token = ?,
+                pool_claimed_by = ?,
+                pool_task_id = ?,
+                pool_claimed_at = ?,
+                pool_lease_expires_at = ?,
+                pool_cooldown_until = ?,
+                pool_last_result = ?,
+                pool_last_detail = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        ''', (
+            pool_status,
+            claim_token,
+            caller_id,
+            task_id,
+            format_db_datetime() if pool_status == 'claimed' else None,
+            lease_expires_at,
+            cooldown_until,
+            result or None,
+            detail or None,
+            account_id
+        ))
+        db.commit()
+        return True
+    except Exception:
+        return False
+
+
+def claim_pool_account(caller_id: str, task_id: str, provider: str = '') -> Optional[Dict[str, Any]]:
+    """从邮箱池领取一个可用账号。"""
+    refresh_pool_states()
+    db = get_db()
+    normalized_provider = (provider or '').strip().lower()
+    lease_seconds = get_pool_default_lease_seconds()
+    lease_expires_at = format_db_datetime(utc_now() + timedelta(seconds=lease_seconds))
+
+    filters = ["status = 'active'", "pool_status = 'available'"]
+    params: List[Any] = []
+    if normalized_provider:
+        filters.append("LOWER(COALESCE(provider, '')) = ?")
+        params.append(normalized_provider)
+
+    where_sql = ' AND '.join(filters)
+    candidate = db.execute(f'''
+        SELECT *
+        FROM accounts
+        WHERE {where_sql}
+        ORDER BY
+            CASE WHEN last_refresh_at IS NULL THEN 1 ELSE 0 END,
+            last_refresh_at DESC,
+            created_at ASC
+        LIMIT 1
+    ''', params).fetchone()
+
+    if not candidate:
+        return None
+
+    account = dict(candidate)
+    claim_token = secrets.token_hex(16)
+    success = set_account_pool_state(
+        account['id'],
+        'claimed',
+        detail='通过外部邮箱池接口领取',
+        result='claimed',
+        claim_token=claim_token,
+        caller_id=caller_id,
+        task_id=task_id,
+        lease_expires_at=lease_expires_at
+    )
+    if not success:
+        return None
+
+    account['provider'] = account.get('provider') or normalize_account_provider(account.get('email', ''))
+    account['pool_status'] = 'claimed'
+    account['pool_claim_token'] = claim_token
+    account['pool_claimed_by'] = caller_id
+    account['pool_task_id'] = task_id
+    account['pool_claimed_at'] = format_db_datetime()
+    account['pool_lease_expires_at'] = lease_expires_at
+    account['pool_cooldown_until'] = None
+    account['pool_last_result'] = 'claimed'
+    account['pool_last_detail'] = '通过外部邮箱池接口领取'
+    return account
+
+
+def validate_claim_request(account_id: int, claim_token: str, caller_id: str, task_id: str) -> tuple[Optional[Dict[str, Any]], Optional[tuple[str, str, int]]]:
+    """校验邮箱池 claim 参数。"""
+    refresh_pool_states()
+    account = get_account_by_id(account_id)
+    if not account:
+        return None, ('ACCOUNT_NOT_FOUND', '账号不存在', 404)
+
+    pool_status = account.get('pool_status') or 'available'
+    if pool_status != 'claimed':
+        return None, ('NOT_CLAIMED', '账号当前不在 claimed 状态', 409)
+
+    if (account.get('pool_claim_token') or '') != claim_token:
+        return None, ('TOKEN_MISMATCH', 'claim_token 不匹配', 409)
+
+    if (account.get('pool_claimed_by') or '') != caller_id or (account.get('pool_task_id') or '') != task_id:
+        return None, ('CALLER_MISMATCH', 'caller_id 或 task_id 与领取记录不一致', 409)
+
+    return account, None
+
+
+def serialize_account_pool(account: Dict[str, Any]) -> Dict[str, Any]:
+    """给前端和对外接口返回统一的邮箱池字段。"""
+    snapshot = build_account_pool_snapshot(account)
+    snapshot['email'] = account.get('email', '')
+    snapshot['account_id'] = account.get('id')
+    snapshot['status'] = account.get('status', 'active')
+    return snapshot
 
 
 # ==================== 工具函数 ====================
@@ -1613,6 +2094,625 @@ def get_email_detail_imap(account: str, client_id: str, refresh_token: str, mess
                 pass
 
 
+# ==================== 对外邮件读取与邮箱池辅助 ====================
+
+def get_account_proxy_url(account: Dict[str, Any]) -> str:
+    """获取账号所属分组代理。"""
+    if account.get('group_id'):
+        group = get_group_by_id(account['group_id'])
+        if group:
+            return group.get('proxy_url', '') or ''
+    return ''
+
+
+def is_proxy_error(error: Any) -> bool:
+    """判断是否为代理相关错误。"""
+    if isinstance(error, dict):
+        return error.get('type') in ('ProxyError', 'ConnectionError')
+    return 'ProxyError' in str(error) or 'ConnectionError' in str(error)
+
+
+def touch_account_last_refresh(account_id: int) -> None:
+    """更新账号最后读取时间。"""
+    db = get_db()
+    db.execute('''
+        UPDATE accounts
+        SET last_refresh_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    ''', (account_id,))
+    db.commit()
+
+
+def format_graph_email_summary(message: Dict[str, Any]) -> Dict[str, Any]:
+    """格式化 Graph API 返回的邮件摘要。"""
+    return {
+        'id': message.get('id'),
+        'subject': message.get('subject', '无主题'),
+        'from': message.get('from', {}).get('emailAddress', {}).get('address', '未知'),
+        'date': to_iso8601(message.get('receivedDateTime')),
+        'is_read': bool(message.get('isRead', False)),
+        'has_attachments': bool(message.get('hasAttachments', False)),
+        'body_preview': message.get('bodyPreview', '') or '',
+    }
+
+
+def format_imap_email_summary(message: Dict[str, Any]) -> Dict[str, Any]:
+    """格式化 IMAP 返回的邮件摘要。"""
+    return {
+        'id': message.get('id'),
+        'subject': message.get('subject', '无主题'),
+        'from': message.get('from', '未知'),
+        'date': to_iso8601(message.get('date')),
+        'is_read': False,
+        'has_attachments': False,
+        'body_preview': message.get('body_preview', '') or '',
+    }
+
+
+def apply_message_filters(messages: List[Dict[str, Any]], from_contains: str = '', subject_contains: str = '',
+                          since_minutes: Optional[int] = None) -> List[Dict[str, Any]]:
+    """对邮件摘要应用常用筛选。"""
+    filtered = []
+    from_keyword = (from_contains or '').strip().lower()
+    subject_keyword = (subject_contains or '').strip().lower()
+    cutoff = utc_now() - timedelta(minutes=since_minutes) if since_minutes else None
+
+    for message in messages:
+        sender = (message.get('from') or '').lower()
+        subject = (message.get('subject') or '').lower()
+        message_time = parse_datetime_value(message.get('date'))
+
+        if from_keyword and from_keyword not in sender:
+            continue
+        if subject_keyword and subject_keyword not in subject:
+            continue
+        if cutoff and (message_time is None or message_time < cutoff):
+            continue
+        filtered.append(message)
+    return filtered
+
+
+def get_imap_folder_candidates(folder: str) -> List[str]:
+    """返回 IMAP 文件夹候选名称。"""
+    folder_map = {
+        'inbox': ['"INBOX"', 'INBOX'],
+        'junkemail': ['"Junk"', '"Junk Email"', 'Junk', '"垃圾邮件"'],
+        'deleteditems': ['"Deleted"', '"Deleted Items"', '"Trash"', 'Deleted', '"已删除邮件"'],
+        'trash': ['"Deleted"', '"Deleted Items"', '"Trash"', 'Deleted', '"已删除邮件"']
+    }
+    return folder_map.get((folder or 'inbox').lower(), ['"INBOX"'])
+
+
+def get_email_detail_graph_result(client_id: str, refresh_token: str, message_id: str, proxy_url: str = None) -> Dict[str, Any]:
+    """获取 Graph API 邮件详情（含错误信息）。"""
+    token_result = get_access_token_graph_result(client_id, refresh_token, proxy_url)
+    if not token_result.get("success"):
+        return {"success": False, "error": token_result.get("error")}
+
+    access_token = token_result.get("access_token")
+    try:
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
+        params = {
+            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,body,bodyPreview,internetMessageId"
+        }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Prefer": "outlook.body-content-type='html'"
+        }
+
+        res = requests.get(url, headers=headers, params=params, timeout=30, proxies=build_proxies(proxy_url))
+        if res.status_code != 200:
+            return {
+                "success": False,
+                "error": build_error_payload(
+                    "EMAIL_DETAIL_FAILED",
+                    "获取邮件详情失败",
+                    "GraphAPIError",
+                    res.status_code,
+                    get_response_details(res)
+                )
+            }
+        return {"success": True, "email": res.json()}
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": build_error_payload(
+                "EMAIL_DETAIL_FAILED",
+                "获取邮件详情失败",
+                type(exc).__name__,
+                500,
+                str(exc)
+            )
+        }
+
+
+def get_email_raw_graph_result(client_id: str, refresh_token: str, message_id: str, proxy_url: str = None) -> Dict[str, Any]:
+    """获取 Graph API 原始 MIME 内容。"""
+    token_result = get_access_token_graph_result(client_id, refresh_token, proxy_url)
+    if not token_result.get("success"):
+        return {"success": False, "error": token_result.get("error")}
+
+    access_token = token_result.get("access_token")
+    try:
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/$value"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        res = requests.get(url, headers=headers, timeout=30, proxies=build_proxies(proxy_url))
+        if res.status_code != 200:
+            return {
+                "success": False,
+                "error": build_error_payload(
+                    "EMAIL_RAW_FAILED",
+                    "获取原始邮件失败",
+                    "GraphAPIError",
+                    res.status_code,
+                    get_response_details(res)
+                )
+            }
+        return {"success": True, "raw": res.text}
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": build_error_payload(
+                "EMAIL_RAW_FAILED",
+                "获取原始邮件失败",
+                type(exc).__name__,
+                500,
+                str(exc)
+            )
+        }
+
+
+def get_email_detail_imap_with_server(account: str, client_id: str, refresh_token: str, message_id: str,
+                                      folder: str = 'inbox', server: str = IMAP_SERVER_NEW) -> Dict[str, Any]:
+    """使用指定 IMAP 服务器获取邮件详情和原始内容。"""
+    token_result = get_access_token_imap_result(client_id, refresh_token)
+    if not token_result.get("success"):
+        return {"success": False, "error": token_result.get("error")}
+
+    access_token = token_result.get("access_token")
+    connection = None
+    try:
+        connection = imaplib.IMAP4_SSL(server, IMAP_PORT)
+        auth_string = f"user={account}\1auth=Bearer {access_token}\1\1".encode('utf-8')
+        connection.authenticate('XOAUTH2', lambda _: auth_string)
+
+        selected_folder = None
+        for imap_folder in get_imap_folder_candidates(folder):
+            try:
+                status, _ = connection.select(imap_folder, readonly=True)
+                if status == 'OK':
+                    selected_folder = imap_folder
+                    break
+            except Exception:
+                continue
+
+        if not selected_folder:
+            return {"success": False, "error": "无法访问目标文件夹"}
+
+        status, msg_data = connection.fetch(
+            message_id.encode() if isinstance(message_id, str) else message_id,
+            '(RFC822)'
+        )
+        if status != 'OK' or not msg_data or not msg_data[0]:
+            return {"success": False, "error": "邮件不存在"}
+
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+        body = get_email_body(msg)
+        html_content = ''
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                content_disposition = str(part.get("Content-Disposition") or "")
+                if "attachment" in content_disposition.lower():
+                    continue
+                if content_type == "text/html":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or 'utf-8'
+                        html_content = payload.decode(charset, errors='replace')
+                        break
+
+        detail = {
+            'id': message_id,
+            'subject': decode_header_value(msg.get("Subject", "无主题")),
+            'from': decode_header_value(msg.get("From", "未知发件人")),
+            'to': decode_header_value(msg.get("To", "")),
+            'cc': decode_header_value(msg.get("Cc", "")),
+            'date': to_iso8601(msg.get("Date")),
+            'body': body,
+            'body_type': 'html' if html_content else 'text',
+            'html_content': html_content,
+            'raw_content': raw_email.decode('utf-8', errors='replace')
+        }
+        return {'success': True, 'email': detail}
+    except Exception as exc:
+        return {'success': False, 'error': str(exc)}
+    finally:
+        if connection:
+            try:
+                connection.logout()
+            except Exception:
+                pass
+
+
+def read_account_messages(account: Dict[str, Any], folder: str = 'inbox', skip: int = 0, top: int = 20,
+                          from_contains: str = '', subject_contains: str = '',
+                          since_minutes: Optional[int] = None, prefer_scan: bool = False) -> Dict[str, Any]:
+    """读取账号邮件摘要，统一处理 Graph / IMAP 回退。"""
+    top = max(1, min(top, EXTERNAL_MAX_MESSAGES))
+    skip = max(0, skip)
+    filters_enabled = bool(from_contains or subject_contains or since_minutes or prefer_scan)
+    fetch_skip = 0 if filters_enabled else skip
+    fetch_top = EXTERNAL_MAX_MESSAGES if filters_enabled else top
+    proxy_url = get_account_proxy_url(account)
+    all_errors = {}
+
+    graph_result = get_emails_graph(account['client_id'], account['refresh_token'], folder, fetch_skip, fetch_top, proxy_url)
+    if graph_result.get('success'):
+        summaries = [format_graph_email_summary(item) for item in graph_result.get('emails', [])]
+        filtered = apply_message_filters(summaries, from_contains, subject_contains, since_minutes)
+        paged = filtered[skip:skip + top]
+        touch_account_last_refresh(account['id'])
+        return {
+            'success': True,
+            'emails': paged,
+            'has_more': len(filtered) > skip + top,
+            'method': 'Graph API'
+        }
+    all_errors['graph'] = graph_result.get('error')
+    if is_proxy_error(graph_result.get('error')):
+        return {
+            'success': False,
+            'code': 'PROXY_ERROR',
+            'message': '代理连接失败',
+            'status': 502,
+            'details': all_errors
+        }
+
+    for server, method_name in ((IMAP_SERVER_NEW, 'IMAP (New)'), (IMAP_SERVER_OLD, 'IMAP (Old)')):
+        imap_result = get_emails_imap_with_server(
+            account['email'], account['client_id'], account['refresh_token'],
+            folder, fetch_skip, fetch_top, server
+        )
+        if imap_result.get('success'):
+            summaries = [format_imap_email_summary(item) for item in imap_result.get('emails', [])]
+            filtered = apply_message_filters(summaries, from_contains, subject_contains, since_minutes)
+            paged = filtered[skip:skip + top]
+            touch_account_last_refresh(account['id'])
+            return {
+                'success': True,
+                'emails': paged,
+                'has_more': len(filtered) > skip + top,
+                'method': method_name
+            }
+        all_errors[method_name.lower().replace(' ', '_')] = imap_result.get('error')
+
+    return {
+        'success': False,
+        'code': 'UPSTREAM_READ_FAILED',
+        'message': '读取邮件失败，所有方式均不可用',
+        'status': 502,
+        'details': all_errors
+    }
+
+
+def read_account_message_detail(account: Dict[str, Any], message_id: str, folder: str = 'inbox') -> Dict[str, Any]:
+    """读取单封邮件详情。"""
+    proxy_url = get_account_proxy_url(account)
+
+    graph_detail = get_email_detail_graph_result(account['client_id'], account['refresh_token'], message_id, proxy_url)
+    if graph_detail.get('success'):
+        detail = graph_detail['email']
+        raw_result = get_email_raw_graph_result(account['client_id'], account['refresh_token'], message_id, proxy_url)
+        raw_content = raw_result.get('raw', '') if raw_result.get('success') else ''
+        touch_account_last_refresh(account['id'])
+        return {
+            'success': True,
+            'email': {
+                'id': detail.get('id'),
+                'email_address': account['email'],
+                'from_address': detail.get('from', {}).get('emailAddress', {}).get('address', '未知'),
+                'to_address': ', '.join([r.get('emailAddress', {}).get('address', '') for r in detail.get('toRecipients', [])]),
+                'subject': detail.get('subject', '无主题'),
+                'content': detail.get('body', {}).get('content', '') if detail.get('body', {}).get('contentType', '').lower() != 'html' else '',
+                'html_content': detail.get('body', {}).get('content', '') if detail.get('body', {}).get('contentType', '').lower() == 'html' else '',
+                'raw_content': raw_content or detail.get('body', {}).get('content', ''),
+                'timestamp': to_iso8601(detail.get('receivedDateTime')),
+                'created_at': to_iso8601(detail.get('receivedDateTime')),
+                'has_html': detail.get('body', {}).get('contentType', '').lower() == 'html',
+                'method': 'Graph API'
+            }
+        }
+    if is_proxy_error(graph_detail.get('error')):
+        return {
+            'success': False,
+            'code': 'PROXY_ERROR',
+            'message': '代理连接失败',
+            'status': 502,
+            'details': {'graph': graph_detail.get('error')}
+        }
+
+    all_errors = {'graph': graph_detail.get('error')}
+    for server, method_name in ((IMAP_SERVER_NEW, 'IMAP (New)'), (IMAP_SERVER_OLD, 'IMAP (Old)')):
+        imap_detail = get_email_detail_imap_with_server(
+            account['email'], account['client_id'], account['refresh_token'], message_id, folder, server
+        )
+        if imap_detail.get('success'):
+            detail = imap_detail['email']
+            touch_account_last_refresh(account['id'])
+            return {
+                'success': True,
+                'email': {
+                    'id': detail.get('id'),
+                    'email_address': account['email'],
+                    'from_address': detail.get('from', '未知发件人'),
+                    'to_address': detail.get('to', ''),
+                    'subject': detail.get('subject', '无主题'),
+                    'content': detail.get('body', ''),
+                    'html_content': detail.get('html_content', ''),
+                    'raw_content': detail.get('raw_content', detail.get('body', '')),
+                    'timestamp': to_iso8601(detail.get('date')),
+                    'created_at': to_iso8601(detail.get('date')),
+                    'has_html': bool(detail.get('html_content')),
+                    'method': method_name
+                }
+            }
+        all_errors[method_name.lower().replace(' ', '_')] = imap_detail.get('error')
+
+    return {
+        'success': False,
+        'code': 'MAIL_NOT_FOUND',
+        'message': '未找到对应邮件',
+        'status': 404,
+        'details': all_errors
+    }
+
+
+def read_account_message_raw(account: Dict[str, Any], message_id: str, folder: str = 'inbox') -> Dict[str, Any]:
+    """读取单封邮件原始内容。"""
+    detail_result = read_account_message_detail(account, message_id, folder)
+    if not detail_result.get('success'):
+        return detail_result
+    raw_content = detail_result['email'].get('raw_content', '')
+    return {
+        'success': True,
+        'raw_content': raw_content,
+        'message': detail_result['email']
+    }
+
+
+def get_external_account_or_error(email_addr: str) -> tuple[Optional[Dict[str, Any]], Optional[tuple[str, str, int]]]:
+    """获取对外接口可用账号。"""
+    account = get_account_by_email(email_addr)
+    if not account:
+        return None, ('ACCOUNT_NOT_FOUND', '账号不存在', 404)
+    if account.get('status') != 'active':
+        return None, ('ACCOUNT_ACCESS_FORBIDDEN', '账号存在但当前不可读', 403)
+    return account, None
+
+
+def probe_account_readability(account: Dict[str, Any]) -> Dict[str, Any]:
+    """探测账号是否可读。"""
+    proxy_url = get_account_proxy_url(account)
+    graph_result = get_access_token_graph_result(account['client_id'], account['refresh_token'], proxy_url)
+    if graph_result.get('success'):
+        return {
+            'upstream_probe_ok': True,
+            'probe_method': 'Graph API',
+            'last_probe_at': to_iso8601(utc_now()),
+            'last_probe_error': ''
+        }
+
+    if is_proxy_error(graph_result.get('error')):
+        return {
+            'upstream_probe_ok': False,
+            'probe_method': 'Graph API',
+            'last_probe_at': to_iso8601(utc_now()),
+            'last_probe_error': '代理连接失败'
+        }
+
+    imap_result = get_access_token_imap_result(account['client_id'], account['refresh_token'])
+    if imap_result.get('success'):
+        return {
+            'upstream_probe_ok': True,
+            'probe_method': 'IMAP',
+            'last_probe_at': to_iso8601(utc_now()),
+            'last_probe_error': ''
+        }
+
+    return {
+        'upstream_probe_ok': False,
+        'probe_method': 'Graph API',
+        'last_probe_at': to_iso8601(utc_now()),
+        'last_probe_error': sanitize_error_details(str(graph_result.get('error') or imap_result.get('error') or '未知错误'))
+    }
+
+
+def build_probe_health_snapshot() -> Dict[str, Any]:
+    """生成健康检查的上游探测结果。"""
+    db = get_db()
+    row = db.execute('''
+        SELECT *
+        FROM accounts
+        WHERE status = 'active'
+        ORDER BY
+            CASE WHEN last_refresh_at IS NULL THEN 1 ELSE 0 END,
+            last_refresh_at DESC,
+            created_at DESC
+        LIMIT 1
+    ''').fetchone()
+
+    if not row:
+        return {
+            'upstream_probe_ok': None,
+            'last_probe_at': '',
+            'last_probe_error': ''
+        }
+
+    return probe_account_readability(dict(row))
+
+
+def find_verification_code_in_text(text: str, code_length: str = '', code_regex: str = '') -> Optional[str]:
+    """从文本中提取验证码。"""
+    if not text:
+        return None
+
+    if code_regex:
+        try:
+            match = re.search(code_regex, text, re.IGNORECASE)
+        except re.error:
+            return None
+        if match:
+            return match.group(1) if match.groups() else match.group(0)
+
+    normalized_length = safe_int(code_length, 0)
+    length_pattern = f'{{{normalized_length}}}' if normalized_length else '{4,8}'
+    token_pattern = rf'((?=[A-Z0-9]{length_pattern}\b)(?=[A-Z0-9]*\d)[A-Z0-9]{length_pattern})'
+    keyword_patterns = [
+        rf'(?:验证码|校验码|verification code|security code|one[- ]time code|otp|code)[^A-Za-z0-9]{{0,24}}{token_pattern}',
+        rf'{token_pattern}[^A-Za-z0-9]{{0,24}}(?:验证码|校验码|verification code|security code|one[- ]time code|otp|code)',
+    ]
+    for pattern in keyword_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    standalone_pattern = rf'\b{token_pattern}\b'
+    candidates = re.findall(standalone_pattern, text, re.IGNORECASE)
+    unique_candidates = []
+    for candidate in candidates:
+        candidate_upper = candidate.upper()
+        if candidate_upper not in unique_candidates:
+            unique_candidates.append(candidate_upper)
+    if len(unique_candidates) == 1:
+        return unique_candidates[0]
+    return None
+
+
+def extract_verification_link(detail: Dict[str, Any]) -> Optional[str]:
+    """从邮件详情中提取高置信度验证链接。"""
+    text_blocks = [
+        detail.get('html_content', ''),
+        detail.get('content', ''),
+        detail.get('subject', ''),
+    ]
+    joined = '\n'.join(block for block in text_blocks if block)
+    if not joined:
+        return None
+
+    links = re.findall(r'https?://[^\s"\'<>]+', joined, re.IGNORECASE)
+    if not links:
+        return None
+
+    cleaned_links = []
+    for link in links:
+        trimmed = link.rstrip(').,;\'"')
+        if trimmed not in cleaned_links:
+            cleaned_links.append(trimmed)
+
+    for link in cleaned_links:
+        lower_link = unquote(link).lower()
+        if any(keyword in lower_link for keyword in LINK_KEYWORDS):
+            return link
+    return None
+
+
+def extract_verification_code(detail: Dict[str, Any], code_length: str = '', code_regex: str = '',
+                              code_source: str = 'all') -> Optional[str]:
+    """从邮件详情中提取验证码。"""
+    source_map = {
+        'subject': [detail.get('subject', '')],
+        'content': [detail.get('content', '')],
+        'html': [detail.get('html_content', '')],
+        'all': [detail.get('subject', ''), detail.get('content', ''), detail.get('html_content', '')],
+    }
+    texts = source_map.get((code_source or 'all').lower(), source_map['all'])
+    for text in texts:
+        code = find_verification_code_in_text(text, code_length, code_regex)
+        if code:
+            return code
+    return None
+
+
+def wait_for_new_message(account: Dict[str, Any], folder: str, from_contains: str, subject_contains: str,
+                         since_minutes: Optional[int], timeout_seconds: int, poll_interval: int) -> Dict[str, Any]:
+    """同步等待新邮件。"""
+    baseline_result = read_account_messages(
+        account, folder=folder, skip=0, top=EXTERNAL_MAX_MESSAGES,
+        from_contains=from_contains, subject_contains=subject_contains,
+        since_minutes=since_minutes, prefer_scan=True
+    )
+    if not baseline_result.get('success'):
+        return baseline_result
+
+    seen_ids = {message.get('id') for message in baseline_result.get('emails', [])}
+    deadline = time.time() + timeout_seconds
+
+    while time.time() <= deadline:
+        time.sleep(poll_interval)
+        current_result = read_account_messages(
+            account, folder=folder, skip=0, top=EXTERNAL_MAX_MESSAGES,
+            from_contains=from_contains, subject_contains=subject_contains,
+            since_minutes=since_minutes, prefer_scan=True
+        )
+        if not current_result.get('success'):
+            return current_result
+
+        for message in current_result.get('emails', []):
+            if message.get('id') not in seen_ids:
+                return {
+                    'success': True,
+                    'message': message,
+                    'method': current_result.get('method', '')
+                }
+        seen_ids.update(message.get('id') for message in current_result.get('emails', []))
+
+    return {
+        'success': False,
+        'code': 'MAIL_NOT_FOUND',
+        'message': '等待超时，未检测到符合条件的新邮件',
+        'status': 404
+    }
+
+
+def run_wait_message_probe(probe_id: str, params: Dict[str, Any]) -> None:
+    """后台执行异步等待新邮件。"""
+    with app.app_context():
+        account, error = get_external_account_or_error(params['email'])
+        if error:
+            wait_message_probes[probe_id].update({
+                'status': 'error',
+                'message': error[1],
+                'error_code': error[0],
+                'completed_at': to_iso8601(utc_now())
+            })
+            return
+
+        result = wait_for_new_message(
+            account=account,
+            folder=params.get('folder', 'inbox'),
+            from_contains=params.get('from_contains', ''),
+            subject_contains=params.get('subject_contains', ''),
+            since_minutes=params.get('since_minutes'),
+            timeout_seconds=params.get('timeout_seconds', 30),
+            poll_interval=params.get('poll_interval', 5)
+        )
+
+        if result.get('success'):
+            wait_message_probes[probe_id].update({
+                'status': 'matched',
+                'message': result.get('message'),
+                'completed_at': to_iso8601(utc_now())
+            })
+        else:
+            wait_message_probes[probe_id].update({
+                'status': 'timeout' if result.get('code') == 'MAIL_NOT_FOUND' else 'error',
+                'message': result.get('message', '等待失败'),
+                'error_code': result.get('code', 'UPSTREAM_READ_FAILED'),
+                'completed_at': to_iso8601(utc_now())
+            })
+
 # ==================== 登录验证 ====================
 
 def login_required(f):
@@ -2086,6 +3186,7 @@ def api_generate_export_verify_token():
 @login_required
 def api_get_accounts():
     """获取所有账号"""
+    refresh_pool_states()
     group_id = request.args.get('group_id', type=int)
     accounts = load_accounts(group_id)
 
@@ -2119,7 +3220,8 @@ def api_get_accounts():
             'last_refresh_error': last_refresh_log['error_message'] if last_refresh_log else None,
             'created_at': acc.get('created_at', ''),
             'updated_at': acc.get('updated_at', ''),
-            'tags': acc.get('tags', [])
+            'tags': acc.get('tags', []),
+            **serialize_account_pool(acc)
         })
     return jsonify({'success': True, 'accounts': safe_accounts})
 
@@ -2230,6 +3332,7 @@ def api_batch_update_account_group():
 @login_required
 def api_search_accounts():
     """全局搜索账号"""
+    refresh_pool_states()
     query = request.args.get('q', '').strip()
 
     if not query:
@@ -2278,7 +3381,8 @@ def api_search_accounts():
             'tags': acc['tags'],
             'last_refresh_at': acc.get('last_refresh_at', ''),
             'last_refresh_status': last_refresh_log['status'] if last_refresh_log else None,
-            'last_refresh_error': last_refresh_log['error_message'] if last_refresh_log else None
+            'last_refresh_error': last_refresh_log['error_message'] if last_refresh_log else None,
+            **serialize_account_pool(acc)
         })
 
     return jsonify({'success': True, 'accounts': safe_accounts})
@@ -2288,6 +3392,7 @@ def api_search_accounts():
 @login_required
 def api_get_account(account_id):
     """获取单个账号详情"""
+    refresh_pool_states()
     account = get_account_by_id(account_id)
     if not account:
         return jsonify({'success': False, 'error': '账号不存在'})
@@ -2305,9 +3410,64 @@ def api_get_account(account_id):
             'remark': account.get('remark', ''),
             'status': account.get('status', 'active'),
             'created_at': account.get('created_at', ''),
-            'updated_at': account.get('updated_at', '')
+            'updated_at': account.get('updated_at', ''),
+            **serialize_account_pool(account)
         }
     })
+
+
+@app.route('/api/pool/stats', methods=['GET'])
+@login_required
+def api_get_pool_stats():
+    """获取邮箱池统计信息。"""
+    return jsonify({
+        'success': True,
+        'pool_counts': get_pool_counts(),
+        'pool_external_enabled': is_pool_external_enabled(),
+        'pool_default_lease_seconds': get_pool_default_lease_seconds(),
+        'pool_cooldown_seconds': get_pool_cooldown_seconds(),
+        'external_api_key_masked': mask_secret(get_external_api_key())
+    })
+
+
+@app.route('/api/accounts/<int:account_id>/pool-state', methods=['POST'])
+@login_required
+def api_update_account_pool_state(account_id):
+    """手动调整单个账号的邮箱池状态。"""
+    data = request.json or {}
+    pool_status = (data.get('pool_status') or '').strip().lower()
+    detail = sanitize_input(data.get('detail', ''), max_length=200)
+
+    if pool_status not in DEFAULT_POOL_STATES or pool_status == 'claimed':
+        return jsonify({'success': False, 'error': '仅支持设置为 available / used / cooldown / frozen / retired'})
+
+    account = get_account_by_id(account_id)
+    if not account:
+        return jsonify({'success': False, 'error': '账号不存在'})
+
+    if account.get('status') != 'active' and pool_status not in ('retired', 'used'):
+        return jsonify({'success': False, 'error': '停用账号只能标记为 used 或 retired'})
+
+    cooldown_until = None
+    result = f'manual_{pool_status}'
+    if pool_status == 'cooldown':
+        cooldown_until = format_db_datetime(utc_now() + timedelta(seconds=get_pool_cooldown_seconds()))
+
+    if set_account_pool_state(
+        account_id,
+        pool_status=pool_status,
+        detail=detail or '通过页面手动调整池状态',
+        result=result,
+        cooldown_until=cooldown_until
+    ):
+        refreshed = get_account_by_id(account_id) or account
+        return jsonify({
+            'success': True,
+            'message': '邮箱池状态已更新',
+            'account': serialize_account_pool(refreshed)
+        })
+
+    return jsonify({'success': False, 'error': '更新邮箱池状态失败'})
 
 
 @app.route('/api/accounts', methods=['POST'])
@@ -2376,9 +3536,15 @@ def api_update_account_status(account_id: int, status: str):
     try:
         db.execute('''
             UPDATE accounts
-            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            SET status = ?,
+                pool_status = CASE
+                    WHEN ? = 'inactive' AND pool_status NOT IN ('used', 'retired') THEN 'retired'
+                    WHEN ? = 'active' AND pool_status = 'retired' THEN 'available'
+                    ELSE pool_status
+                END,
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-        ''', (status, account_id))
+        ''', (status, status, status, account_id))
         db.commit()
         return jsonify({'success': True, 'message': '状态更新成功'})
     except Exception:
@@ -4321,6 +5487,9 @@ def api_get_settings():
     # 返回 DuckMail 设置
     settings['duckmail_base_url'] = get_duckmail_base_url()
     settings['duckmail_api_key'] = get_duckmail_api_key()
+    settings['pool_external_enabled'] = 'true' if is_pool_external_enabled() else 'false'
+    settings['pool_default_lease_seconds'] = str(get_pool_default_lease_seconds())
+    settings['pool_cooldown_seconds'] = str(get_pool_cooldown_seconds())
     return jsonify({'success': True, 'settings': settings})
 
 
@@ -4447,6 +5616,40 @@ def api_update_settings():
         else:
             errors.append('更新 DuckMail API Key 失败')
 
+    if 'pool_external_enabled' in data:
+        value = str(data['pool_external_enabled']).lower()
+        if value in ('true', 'false'):
+            if set_setting('pool_external_enabled', value):
+                updated.append('邮箱池外部接口开关')
+            else:
+                errors.append('更新邮箱池外部接口开关失败')
+        else:
+            errors.append('邮箱池外部接口开关必须是 true 或 false')
+
+    if 'pool_default_lease_seconds' in data:
+        try:
+            seconds = int(data['pool_default_lease_seconds'])
+            if seconds < 30 or seconds > 86400:
+                errors.append('默认租约时长必须在 30-86400 秒之间')
+            elif set_setting('pool_default_lease_seconds', str(seconds)):
+                updated.append('默认租约时长')
+            else:
+                errors.append('更新默认租约时长失败')
+        except ValueError:
+            errors.append('默认租约时长必须是整数')
+
+    if 'pool_cooldown_seconds' in data:
+        try:
+            seconds = int(data['pool_cooldown_seconds'])
+            if seconds < 60 or seconds > 604800:
+                errors.append('冷却时长必须在 60-604800 秒之间')
+            elif set_setting('pool_cooldown_seconds', str(seconds)):
+                updated.append('冷却时长')
+            else:
+                errors.append('更新冷却时长失败')
+        except ValueError:
+            errors.append('冷却时长必须是整数')
+
     if errors:
         return jsonify({'success': False, 'error': '；'.join(errors)})
 
@@ -4458,100 +5661,614 @@ def api_update_settings():
 
 # ==================== 对外 API ====================
 
+def parse_external_mail_request(default_top: int = 20, default_since_minutes: Optional[int] = None):
+    """解析对外读信接口的公共参数。"""
+    email_addr = request.args.get('email', '').strip()
+    folder = request.args.get('folder', 'inbox').strip().lower() or 'inbox'
+    skip = safe_int(request.args.get('skip', 0), 0)
+    top = safe_int(request.args.get('top', default_top), default_top)
+    from_contains = request.args.get('from_contains', '').strip()
+    subject_contains = request.args.get('subject_contains', '').strip()
+    since_minutes_raw = request.args.get('since_minutes')
+    since_minutes = default_since_minutes
+
+    if since_minutes_raw not in (None, ''):
+        since_minutes = safe_int(since_minutes_raw, 0)
+        if since_minutes <= 0:
+            return None, ('INVALID_PARAM', 'since_minutes 必须大于 0', 400)
+
+    if not email_addr:
+        return None, ('INVALID_PARAM', '缺少 email 参数', 400)
+
+    if folder not in ('inbox', 'junkemail', 'deleteditems'):
+        return None, ('INVALID_PARAM', 'folder 参数无效，支持 inbox、junkemail、deleteditems', 400)
+
+    if top < 1 or top > EXTERNAL_MAX_MESSAGES:
+        return None, ('INVALID_PARAM', f'top 必须在 1-{EXTERNAL_MAX_MESSAGES} 之间', 400)
+
+    if skip < 0:
+        return None, ('INVALID_PARAM', 'skip 不能小于 0', 400)
+
+    return {
+        'email': email_addr,
+        'folder': folder,
+        'skip': skip,
+        'top': top,
+        'from_contains': from_contains,
+        'subject_contains': subject_contains,
+        'since_minutes': since_minutes,
+    }, None
+
+
+def external_result_or_error(result: Dict[str, Any]):
+    """将内部读取结果转换为统一外部响应。"""
+    if result.get('success'):
+        return None
+    return external_error(
+        result.get('code', 'UPSTREAM_READ_FAILED'),
+        result.get('message', '读取失败'),
+        result.get('status', 502),
+        result.get('details')
+    )
+
+
+@app.route('/api/external/health', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_health():
+    """对外健康检查。"""
+    db = get_db()
+    db.execute('SELECT 1').fetchone()
+    probe = build_probe_health_snapshot()
+    return external_success({
+        'status': 'ok',
+        'service': 'outlookEmail',
+        'version': APP_VERSION,
+        'server_time_utc': to_iso8601(utc_now()),
+        'database': 'ok',
+        **probe
+    })
+
+
+@app.route('/api/external/capabilities', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_capabilities():
+    """返回当前开放的外部能力。"""
+    features = [
+        'message_list',
+        'message_detail',
+        'raw_content',
+        'verification_code',
+        'verification_link',
+        'wait_message',
+    ]
+    if is_pool_external_enabled():
+        features.extend([
+            'pool_claim_random',
+            'pool_claim_release',
+            'pool_claim_complete',
+            'pool_stats'
+        ])
+
+    restricted_features = []
+    if not is_pool_external_enabled():
+        restricted_features.extend([
+            'pool_claim_random',
+            'pool_claim_release',
+            'pool_claim_complete',
+            'pool_stats'
+        ])
+
+    return external_success({
+        'public_mode': False,
+        'features': features,
+        'restricted_features': restricted_features
+    })
+
+
+@app.route('/api/external/account-status', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_account_status():
+    """检查单个账号当前可读状态。"""
+    email_addr = request.args.get('email', '').strip()
+    if not email_addr:
+        return external_error('INVALID_PARAM', '缺少 email 参数', 400)
+
+    account = get_account_by_email(email_addr)
+    if not account:
+        return external_success({
+            'exists': False,
+            'email': email_addr,
+            'account_type': 'outlook',
+            'provider': DEFAULT_POOL_PROVIDER,
+            'group_id': None,
+            'status': 'missing',
+            'last_refresh_at': '',
+            'preferred_method': 'Graph API',
+            'can_read': False,
+            'upstream_probe_ok': False,
+            'probe_method': '',
+            'last_probe_at': '',
+            'last_probe_error': '账号不存在'
+        })
+
+    probe = probe_account_readability(account)
+    return external_success({
+        'exists': True,
+        'email': account['email'],
+        'account_type': 'outlook',
+        'provider': account.get('provider') or normalize_account_provider(account.get('email', '')),
+        'group_id': account.get('group_id'),
+        'status': account.get('status', 'active'),
+        'last_refresh_at': to_iso8601(account.get('last_refresh_at')),
+        'preferred_method': 'Graph API',
+        'can_read': account.get('status') == 'active' and bool(probe.get('upstream_probe_ok')),
+        **probe
+    })
+
+
+@app.route('/api/external/messages', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_messages():
+    """列出邮件摘要。"""
+    params, error = parse_external_mail_request()
+    if error:
+        return external_error(*error)
+
+    account, account_error = get_external_account_or_error(params['email'])
+    if account_error:
+        return external_error(*account_error)
+
+    result = read_account_messages(
+        account,
+        folder=params['folder'],
+        skip=params['skip'],
+        top=params['top'],
+        from_contains=params['from_contains'],
+        subject_contains=params['subject_contains'],
+        since_minutes=params['since_minutes']
+    )
+    if not result.get('success'):
+        return external_result_or_error(result)
+
+    return external_success({
+        'email': params['email'],
+        'folder': params['folder'],
+        'count': len(result['emails']),
+        'has_more': result.get('has_more', False),
+        'method': result.get('method', ''),
+        'emails': result['emails']
+    })
+
+
+@app.route('/api/external/messages/latest', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_latest_message():
+    """获取最新的匹配邮件。"""
+    params, error = parse_external_mail_request(default_top=1)
+    if error:
+        return external_error(*error)
+
+    account, account_error = get_external_account_or_error(params['email'])
+    if account_error:
+        return external_error(*account_error)
+
+    result = read_account_messages(
+        account,
+        folder=params['folder'],
+        skip=0,
+        top=EXTERNAL_MAX_MESSAGES,
+        from_contains=params['from_contains'],
+        subject_contains=params['subject_contains'],
+        since_minutes=params['since_minutes'],
+        prefer_scan=True
+    )
+    if not result.get('success'):
+        return external_result_or_error(result)
+
+    latest = result.get('emails', [None])[0]
+    if not latest:
+        return external_error('MAIL_NOT_FOUND', '未找到匹配邮件', 404)
+
+    return external_success({
+        'email': params['email'],
+        'folder': params['folder'],
+        'method': result.get('method', ''),
+        'message': latest
+    })
+
+
+@app.route('/api/external/messages/<path:message_id>', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_message_detail(message_id):
+    """获取单封邮件详情。"""
+    email_addr = request.args.get('email', '').strip()
+    folder = request.args.get('folder', 'inbox').strip().lower() or 'inbox'
+    if not email_addr:
+        return external_error('INVALID_PARAM', '缺少 email 参数', 400)
+
+    account, account_error = get_external_account_or_error(email_addr)
+    if account_error:
+        return external_error(*account_error)
+
+    result = read_account_message_detail(account, message_id, folder)
+    if not result.get('success'):
+        return external_result_or_error(result)
+
+    return external_success(result['email'])
+
+
+@app.route('/api/external/messages/<path:message_id>/raw', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_message_raw(message_id):
+    """获取单封邮件原始内容。"""
+    email_addr = request.args.get('email', '').strip()
+    folder = request.args.get('folder', 'inbox').strip().lower() or 'inbox'
+    if not email_addr:
+        return external_error('INVALID_PARAM', '缺少 email 参数', 400)
+
+    account, account_error = get_external_account_or_error(email_addr)
+    if account_error:
+        return external_error(*account_error)
+
+    result = read_account_message_raw(account, message_id, folder)
+    if not result.get('success'):
+        return external_result_or_error(result)
+
+    return external_success({
+        'email': email_addr,
+        'folder': folder,
+        'message_id': message_id,
+        'raw_content': result['raw_content'],
+        'method': result['message'].get('method', '')
+    })
+
+
+@app.route('/api/external/verification-code', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_verification_code():
+    """提取验证码。"""
+    params, error = parse_external_mail_request(default_top=10, default_since_minutes=DEFAULT_VERIFICATION_LOOKBACK_MINUTES)
+    if error:
+        return external_error(*error)
+
+    account, account_error = get_external_account_or_error(params['email'])
+    if account_error:
+        return external_error(*account_error)
+
+    code_length = request.args.get('code_length', '').strip()
+    code_regex = request.args.get('code_regex', '').strip()
+    code_source = request.args.get('code_source', 'all').strip().lower() or 'all'
+
+    result = read_account_messages(
+        account,
+        folder=params['folder'],
+        skip=0,
+        top=min(10, EXTERNAL_MAX_MESSAGES),
+        from_contains=params['from_contains'],
+        subject_contains=params['subject_contains'],
+        since_minutes=params['since_minutes'],
+        prefer_scan=True
+    )
+    if not result.get('success'):
+        return external_result_or_error(result)
+
+    for summary in result.get('emails', []):
+        detail_result = read_account_message_detail(account, summary['id'], params['folder'])
+        if not detail_result.get('success'):
+            continue
+        detail = detail_result['email']
+        code = extract_verification_code(detail, code_length, code_regex, code_source)
+        if code:
+            return external_success({
+                'email': params['email'],
+                'folder': params['folder'],
+                'code': code,
+                'message_id': detail['id'],
+                'subject': detail.get('subject', ''),
+                'from_address': detail.get('from_address', ''),
+                'timestamp': detail.get('timestamp', ''),
+                'method': detail.get('method', '')
+            })
+
+    return external_error('VERIFICATION_CODE_NOT_FOUND', '未提取到高置信度验证码', 404)
+
+
+@app.route('/api/external/verification-link', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_verification_link():
+    """提取验证链接。"""
+    params, error = parse_external_mail_request(default_top=10, default_since_minutes=DEFAULT_VERIFICATION_LOOKBACK_MINUTES)
+    if error:
+        return external_error(*error)
+
+    account, account_error = get_external_account_or_error(params['email'])
+    if account_error:
+        return external_error(*account_error)
+
+    result = read_account_messages(
+        account,
+        folder=params['folder'],
+        skip=0,
+        top=min(10, EXTERNAL_MAX_MESSAGES),
+        from_contains=params['from_contains'],
+        subject_contains=params['subject_contains'],
+        since_minutes=params['since_minutes'],
+        prefer_scan=True
+    )
+    if not result.get('success'):
+        return external_result_or_error(result)
+
+    for summary in result.get('emails', []):
+        detail_result = read_account_message_detail(account, summary['id'], params['folder'])
+        if not detail_result.get('success'):
+            continue
+        detail = detail_result['email']
+        link = extract_verification_link(detail)
+        if link:
+            return external_success({
+                'email': params['email'],
+                'folder': params['folder'],
+                'verification_link': link,
+                'message_id': detail['id'],
+                'subject': detail.get('subject', ''),
+                'from_address': detail.get('from_address', ''),
+                'timestamp': detail.get('timestamp', ''),
+                'method': detail.get('method', '')
+            })
+
+    return external_error('VERIFICATION_LINK_NOT_FOUND', '未提取到高置信度验证链接', 404)
+
+
+@app.route('/api/external/wait-message', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_wait_message():
+    """等待新邮件。"""
+    params, error = parse_external_mail_request(default_top=1, default_since_minutes=DEFAULT_VERIFICATION_LOOKBACK_MINUTES)
+    if error:
+        return external_error(*error)
+
+    account, account_error = get_external_account_or_error(params['email'])
+    if account_error:
+        return external_error(*account_error)
+
+    timeout_seconds = safe_int(request.args.get('timeout_seconds', 30), 30)
+    poll_interval = safe_int(request.args.get('poll_interval', 5), 5)
+    mode = request.args.get('mode', 'sync').strip().lower() or 'sync'
+
+    if timeout_seconds < 1 or timeout_seconds > 120:
+        return external_error('INVALID_PARAM', 'timeout_seconds 必须在 1-120 之间', 400)
+    if poll_interval < 1 or poll_interval > timeout_seconds:
+        return external_error('INVALID_PARAM', 'poll_interval 必须大于 0 且不超过 timeout_seconds', 400)
+    if mode not in ('sync', 'async'):
+        return external_error('INVALID_PARAM', 'mode 仅支持 sync 或 async', 400)
+
+    if mode == 'async':
+        probe_id = uuid.uuid4().hex
+        probe_params = {
+            **params,
+            'timeout_seconds': timeout_seconds,
+            'poll_interval': poll_interval
+        }
+        wait_message_probes[probe_id] = {
+            'probe_id': probe_id,
+            'status': 'pending',
+            'created_at': to_iso8601(utc_now()),
+            'email': params['email'],
+            'folder': params['folder']
+        }
+        worker = threading.Thread(
+            target=run_wait_message_probe,
+            args=(probe_id, probe_params),
+            daemon=True
+        )
+        worker.start()
+        return external_success({
+            'probe_id': probe_id,
+            'status': 'pending'
+        }, status=202)
+
+    result = wait_for_new_message(
+        account=account,
+        folder=params['folder'],
+        from_contains=params['from_contains'],
+        subject_contains=params['subject_contains'],
+        since_minutes=params['since_minutes'],
+        timeout_seconds=timeout_seconds,
+        poll_interval=poll_interval
+    )
+    if not result.get('success'):
+        return external_result_or_error(result)
+
+    return external_success({
+        'email': params['email'],
+        'folder': params['folder'],
+        'method': result.get('method', ''),
+        'message': result['message']
+    })
+
+
+@app.route('/api/external/probe/<probe_id>', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_probe_status(probe_id):
+    """查询异步等待任务。"""
+    probe = wait_message_probes.get(probe_id)
+    if not probe:
+        return external_error('MAIL_NOT_FOUND', 'probe 不存在', 404)
+    return external_success(probe)
+
+
+@app.route('/api/external/pool/claim-random', methods=['POST'])
+@csrf_exempt
+@api_key_required
+def api_external_pool_claim_random():
+    """领取一个邮箱池账号。"""
+    if not is_pool_external_enabled():
+        return external_error('FEATURE_DISABLED', '邮箱池外部接口已禁用', 403)
+
+    data = request.get_json(silent=True) or {}
+    caller_id = (data.get('caller_id') or '').strip()
+    task_id = (data.get('task_id') or '').strip()
+    provider = (data.get('provider') or DEFAULT_POOL_PROVIDER).strip().lower()
+
+    if not caller_id or not task_id:
+        return external_error('INVALID_PARAM', 'caller_id 和 task_id 为必填参数', 400)
+
+    account = claim_pool_account(caller_id, task_id, provider)
+    if not account:
+        return external_error('NO_AVAILABLE_ACCOUNT', '池中没有符合条件的可用邮箱', 200)
+
+    return external_success({
+        'account_id': account['id'],
+        'email': account['email'],
+        'provider': account.get('provider') or normalize_account_provider(account.get('email', '')),
+        'claim_token': account.get('pool_claim_token', ''),
+        'lease_expires_at': to_iso8601(account.get('pool_lease_expires_at'))
+    })
+
+
+@app.route('/api/external/pool/claim-release', methods=['POST'])
+@csrf_exempt
+@api_key_required
+def api_external_pool_claim_release():
+    """释放已领取的邮箱。"""
+    if not is_pool_external_enabled():
+        return external_error('FEATURE_DISABLED', '邮箱池外部接口已禁用', 403)
+
+    data = request.get_json(silent=True) or {}
+    account_id = safe_int(data.get('account_id'), 0)
+    claim_token = (data.get('claim_token') or '').strip()
+    caller_id = (data.get('caller_id') or '').strip()
+    task_id = (data.get('task_id') or '').strip()
+    reason = sanitize_input(data.get('reason', ''), max_length=200)
+
+    if not account_id or not claim_token or not caller_id or not task_id:
+        return external_error('INVALID_PARAM', 'account_id、claim_token、caller_id、task_id 为必填参数', 400)
+
+    account, validation_error = validate_claim_request(account_id, claim_token, caller_id, task_id)
+    if validation_error:
+        return external_error(*validation_error)
+
+    if not set_account_pool_state(
+        account_id,
+        pool_status='available',
+        detail=reason or '外部调用释放邮箱',
+        result='released'
+    ):
+        return external_error('UPSTREAM_READ_FAILED', '释放邮箱失败', 500)
+
+    return external_success({
+        'account_id': account_id,
+        'email': account['email'],
+        'pool_status': 'available'
+    })
+
+
+@app.route('/api/external/pool/claim-complete', methods=['POST'])
+@csrf_exempt
+@api_key_required
+def api_external_pool_claim_complete():
+    """回传注册结果。"""
+    if not is_pool_external_enabled():
+        return external_error('FEATURE_DISABLED', '邮箱池外部接口已禁用', 403)
+
+    data = request.get_json(silent=True) or {}
+    account_id = safe_int(data.get('account_id'), 0)
+    claim_token = (data.get('claim_token') or '').strip()
+    caller_id = (data.get('caller_id') or '').strip()
+    task_id = (data.get('task_id') or '').strip()
+    result = (data.get('result') or '').strip().lower()
+    detail = sanitize_input(data.get('detail', ''), max_length=200)
+
+    if not account_id or not claim_token or not caller_id or not task_id or not result:
+        return external_error('INVALID_PARAM', 'account_id、claim_token、caller_id、task_id、result 为必填参数', 400)
+    if result not in POOL_RESULT_STATE_MAP:
+        return external_error('INVALID_PARAM', 'result 参数无效', 400)
+
+    account, validation_error = validate_claim_request(account_id, claim_token, caller_id, task_id)
+    if validation_error:
+        return external_error(*validation_error)
+
+    new_state = POOL_RESULT_STATE_MAP[result]
+    cooldown_until = None
+    if new_state == 'cooldown':
+        cooldown_until = format_db_datetime(utc_now() + timedelta(seconds=get_pool_cooldown_seconds()))
+
+    if not set_account_pool_state(
+        account_id,
+        pool_status=new_state,
+        detail=detail or f'外部结果回传：{result}',
+        result=result,
+        cooldown_until=cooldown_until
+    ):
+        return external_error('UPSTREAM_READ_FAILED', '更新邮箱池结果失败', 500)
+
+    return external_success({
+        'account_id': account_id,
+        'email': account['email'],
+        'pool_status': new_state,
+        'result': result,
+        'cooldown_until': to_iso8601(cooldown_until) if cooldown_until else ''
+    })
+
+
+@app.route('/api/external/pool/stats', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_pool_stats():
+    """获取邮箱池状态统计。"""
+    if not is_pool_external_enabled():
+        return external_error('FEATURE_DISABLED', '邮箱池外部接口已禁用', 403)
+    return external_success({
+        'pool_counts': get_pool_counts()
+    })
+
+
 @app.route('/api/external/emails', methods=['GET'])
 @csrf_exempt
 @api_key_required
 def api_external_get_emails():
-    """对外 API：通过 API Key 获取邮件列表"""
-    email_addr = request.args.get('email', '').strip()
-    folder = request.args.get('folder', 'inbox').strip().lower()
-    skip = int(request.args.get('skip', 0))
-    top = int(request.args.get('top', 20))
+    """兼容旧版对外接口：获取邮件摘要列表。"""
+    params, error = parse_external_mail_request()
+    if error:
+        return jsonify({'success': False, 'error': error[1]}), error[2]
 
-    if not email_addr:
-        return jsonify({'success': False, 'error': '缺少 email 参数'}), 400
+    account, account_error = get_external_account_or_error(params['email'])
+    if account_error:
+        return jsonify({'success': False, 'error': account_error[1]}), account_error[2]
 
-    # 验证 folder 参数
-    valid_folders = ['inbox', 'junkemail']
-    if folder not in valid_folders:
-        return jsonify({'success': False, 'error': f'folder 参数无效，支持: {", ".join(valid_folders)}'}), 400
-
-    # 限制分页大小
-    if top > 50:
-        top = 50
-
-    account = get_account_by_email(email_addr)
-    if not account:
-        return jsonify({'success': False, 'error': '邮箱账号不存在'}), 404
-
-    # 获取分组代理设置
-    proxy_url = ''
-    if account.get('group_id'):
-        group = get_group_by_id(account['group_id'])
-        if group:
-            proxy_url = group.get('proxy_url', '') or ''
-
-    # 收集所有错误信息
-    all_errors = {}
-
-    # 1. 尝试 Graph API
-    graph_result = get_emails_graph(account['client_id'], account['refresh_token'], folder, skip, top, proxy_url)
-    if graph_result.get('success'):
-        emails = graph_result.get('emails', [])
-        formatted = []
-        for e in emails:
-            formatted.append({
-                'id': e.get('id'),
-                'subject': e.get('subject', '无主题'),
-                'from': e.get('from', {}).get('emailAddress', {}).get('address', '未知'),
-                'date': e.get('receivedDateTime', ''),
-                'is_read': e.get('isRead', False),
-                'has_attachments': e.get('hasAttachments', False),
-                'body_preview': e.get('bodyPreview', '')
-            })
-        return jsonify({
-            'success': True,
-            'emails': formatted,
-            'method': 'Graph API',
-            'has_more': len(formatted) >= top
-        })
-    else:
-        graph_error = graph_result.get('error')
-        all_errors['graph'] = graph_error
-        if isinstance(graph_error, dict) and graph_error.get('type') in ('ProxyError', 'ConnectionError'):
-            return jsonify({'success': False, 'error': '代理连接失败', 'details': all_errors})
-
-    # 2. 尝试新版 IMAP
-    imap_new_result = get_emails_imap_with_server(
-        account['email'], account['client_id'], account['refresh_token'],
-        folder, skip, top, IMAP_SERVER_NEW
+    result = read_account_messages(
+        account,
+        folder=params['folder'],
+        skip=params['skip'],
+        top=params['top'],
+        from_contains=params['from_contains'],
+        subject_contains=params['subject_contains'],
+        since_minutes=params['since_minutes']
     )
-    if imap_new_result.get('success'):
+    if not result.get('success'):
         return jsonify({
-            'success': True,
-            'emails': imap_new_result.get('emails', []),
-            'method': 'IMAP (New)',
-            'has_more': False
-        })
-    else:
-        all_errors['imap_new'] = imap_new_result.get('error')
+            'success': False,
+            'error': result.get('message', '读取失败'),
+            'details': result.get('details')
+        }), result.get('status', 502)
 
-    # 3. 尝试旧版 IMAP
-    imap_old_result = get_emails_imap_with_server(
-        account['email'], account['client_id'], account['refresh_token'],
-        folder, skip, top, IMAP_SERVER_OLD
-    )
-    if imap_old_result.get('success'):
-        return jsonify({
-            'success': True,
-            'emails': imap_old_result.get('emails', []),
-            'method': 'IMAP (Old)',
-            'has_more': False
-        })
-    else:
-        all_errors['imap_old'] = imap_old_result.get('error')
-
-    return jsonify({'success': False, 'error': '无法获取邮件，所有方式均失败', 'details': all_errors})
+    return jsonify({
+        'success': True,
+        'emails': result['emails'],
+        'method': result.get('method', ''),
+        'has_more': result.get('has_more', False)
+    })
 
 
 # ==================== 定时任务调度器 ====================
