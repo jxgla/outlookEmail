@@ -241,7 +241,8 @@ curl -H "X-API-Key: YOUR_API_KEY" \
 说明：
 
 - 当前项目是“按邮箱读信”，不是“按 claim_id 读信”
-- `verification-code` / `verification-link` / `wait-message` 默认会带最近时间窗口来降低误匹配
+- `verification-code` 会固定比较 `inbox` 与 `junkemail` 各自最新一封匹配邮件，再从时间更新的一封里提取验证码
+- `verification-link` / `wait-message` 默认会带最近时间窗口来降低误匹配
 
 ---
 
@@ -300,7 +301,7 @@ curl -H "X-API-Key: YOUR_API_KEY" \
 
 用途：
 
-- 从最近匹配邮件中提取高置信度验证码
+- 从 `inbox` 与 `junkemail` 各自最新一封匹配邮件中，选时间更新的一封提取高置信度验证码
 
 额外参数：
 
@@ -312,7 +313,8 @@ curl -H "X-API-Key: YOUR_API_KEY" \
 
 默认行为：
 
-- 如果未传 `since_minutes`，默认只搜索最近 `10` 分钟邮件
+- 如果未传 `since_minutes`，不会额外限制时间窗口，而是直接比较 `inbox` 与 `junkemail` 各自最新一封匹配邮件
+- 即使传入 `folder`，该接口仍会固定比较 `inbox` 与 `junkemail`，避免验证码落到垃圾邮件时漏读
 - 默认只接受带数字的验证码，避免把正文普通英文单词误判成 code
 
 示例：

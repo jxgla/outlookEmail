@@ -204,6 +204,7 @@ user@outlook.com----password123----24d9a0ed-8787-4584-883c-2fd79308940a----0.AXE
 ### 4. 对外 API / 注册邮箱池接口
 
 通过 API Key 直接获取邮件、提取验证码/验证链接、等待新邮件，并支持邮箱池领取 / 释放 / 回传结果。
+其中验证码提取会自动比较 `inbox` 与 `junkemail` 各自最新一封匹配邮件，再从更新的一封里返回验证码。
 
 **配置步骤：**
 1. 点击「⚙️ 设置」→ 在「对外 API Key」处点击「🔑 随机生成」→ 保存
@@ -219,7 +220,7 @@ curl -X POST -H "Content-Type: application/json" -H "X-API-Key: your-api-key" \
   -d '{"caller_id":"worker-01","task_id":"task-001","provider":"outlook"}' \
   "http://localhost:5000/api/external/pool/claim-random"
 
-# 提取验证码
+# 提取验证码（自动比较 inbox 与 junkemail 最新一封）
 curl -H "X-API-Key: your-api-key" \
   "http://localhost:5000/api/external/verification-code?email=user@outlook.com&subject_contains=verify"
 

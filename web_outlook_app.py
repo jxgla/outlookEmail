@@ -2635,6 +2635,160 @@ def extract_verification_code(detail: Dict[str, Any], code_length: str = '', cod
     return None
 
 
+def get_latest_message_from_folder(account: Dict[str, Any], folder: str, from_contains: str = '',
+                                   subject_contains: str = '', since_minutes: Optional[int] = None) -> Dict[str, Any]:
+    """获取某个文件夹中最新的一封匹配邮件。"""
+    result = read_account_messages(
+        account,
+        folder=folder,
+        skip=0,
+        top=1,
+        from_contains=from_contains,
+        subject_contains=subject_contains,
+        since_minutes=since_minutes,
+        prefer_scan=True
+    )
+    if not result.get('success'):
+        return result
+
+    emails = result.get('emails', [])
+    return {
+        'success': True,
+        'folder': folder,
+        'method': result.get('method', ''),
+        'message': emails[0] if emails else None
+    }
+
+
+def select_latest_message_between_folders(account: Dict[str, Any], folders: tuple[str, ...] = ('inbox', 'junkemail'),
+                                          from_contains: str = '', subject_contains: str = '',
+                                          since_minutes: Optional[int] = None) -> Dict[str, Any]:
+    """从多个文件夹的最新邮件中选出时间更新的一封。"""
+    candidates = []
+    errors: Dict[str, Any] = {}
+
+    for folder in folders:
+        result = get_latest_message_from_folder(
+            account,
+            folder=folder,
+            from_contains=from_contains,
+            subject_contains=subject_contains,
+            since_minutes=since_minutes
+        )
+        if result.get('success'):
+            message = result.get('message')
+            if message:
+                candidates.append(result)
+        else:
+            errors[folder] = {
+                'code': result.get('code', 'UPSTREAM_READ_FAILED'),
+                'message': result.get('message', '读取失败'),
+                'details': result.get('details')
+            }
+
+    if not candidates:
+        if len(errors) == len(folders):
+            return {
+                'success': False,
+                'code': 'UPSTREAM_READ_FAILED',
+                'message': '收件箱和垃圾邮件都读取失败',
+                'status': 502,
+                'details': errors
+            }
+        return {
+            'success': False,
+            'code': 'MAIL_NOT_FOUND',
+            'message': '收件箱和垃圾邮件中都没有可匹配的新邮件',
+            'status': 404,
+            'details': {'folders': list(folders), 'errors': errors}
+        }
+
+    def sort_key(item: Dict[str, Any]):
+        message = item.get('message') or {}
+        timestamp = parse_datetime_value(message.get('date'))
+        return timestamp or datetime.min.replace(tzinfo=timezone.utc)
+
+    candidates.sort(key=sort_key, reverse=True)
+    selected = candidates[0]
+    return {
+        'success': True,
+        'selected': selected,
+        'candidates': [
+            {
+                'folder': item['folder'],
+                'message_id': (item.get('message') or {}).get('id', ''),
+                'date': (item.get('message') or {}).get('date', ''),
+                'subject': (item.get('message') or {}).get('subject', ''),
+                'method': item.get('method', '')
+            }
+            for item in candidates
+        ],
+        'errors': errors
+    }
+
+
+def get_latest_verification_code_result(account: Dict[str, Any], code_length: str = '', code_regex: str = '',
+                                        code_source: str = 'all', from_contains: str = '',
+                                        subject_contains: str = '', since_minutes: Optional[int] = None) -> Dict[str, Any]:
+    """从 inbox 与 junkemail 的最新邮件中提取验证码。"""
+    latest_result = select_latest_message_between_folders(
+        account,
+        folders=('inbox', 'junkemail'),
+        from_contains=from_contains,
+        subject_contains=subject_contains,
+        since_minutes=since_minutes
+    )
+    if not latest_result.get('success'):
+        failure_code = latest_result.get('code', 'VERIFICATION_CODE_NOT_FOUND')
+        if failure_code == 'MAIL_NOT_FOUND':
+            failure_code = 'VERIFICATION_CODE_NOT_FOUND'
+        return {
+            'success': False,
+            'code': failure_code,
+            'message': '未提取到高置信度验证码' if failure_code == 'VERIFICATION_CODE_NOT_FOUND' else latest_result.get('message', '提取失败'),
+            'status': latest_result.get('status', 404 if failure_code == 'VERIFICATION_CODE_NOT_FOUND' else 502),
+            'details': latest_result.get('details')
+        }
+
+    selected = latest_result['selected']
+    selected_message = selected.get('message') or {}
+    detail_result = read_account_message_detail(account, selected_message.get('id', ''), selected['folder'])
+    if not detail_result.get('success'):
+        return detail_result
+
+    detail = detail_result['email']
+    code = extract_verification_code(detail, code_length, code_regex, code_source)
+    if not code:
+        return {
+            'success': False,
+            'code': 'VERIFICATION_CODE_NOT_FOUND',
+            'message': '未提取到高置信度验证码',
+            'status': 404,
+            'details': {
+                'selected_folder': selected['folder'],
+                'message_id': detail.get('id', ''),
+                'subject': detail.get('subject', ''),
+                'candidates': latest_result.get('candidates', [])
+            }
+        }
+
+    return {
+        'success': True,
+        'data': {
+            'email': account['email'],
+            'folder': selected['folder'],
+            'selected_folder': selected['folder'],
+            'code': code,
+            'message_id': detail.get('id', ''),
+            'subject': detail.get('subject', ''),
+            'from_address': detail.get('from_address', ''),
+            'timestamp': detail.get('timestamp', ''),
+            'method': detail.get('method', ''),
+            'candidates': latest_result.get('candidates', [])
+        }
+    }
+
+
 def wait_for_new_message(account: Dict[str, Any], folder: str, from_contains: str, subject_contains: str,
                          since_minutes: Optional[int], timeout_seconds: int, poll_interval: int) -> Dict[str, Any]:
     """同步等待新邮件。"""
@@ -3468,6 +3622,24 @@ def api_update_account_pool_state(account_id):
         })
 
     return jsonify({'success': False, 'error': '更新邮箱池状态失败'})
+
+
+@app.route('/api/accounts/<int:account_id>/latest-verification-code', methods=['GET'])
+@login_required
+def api_get_latest_verification_code(account_id):
+    """提取账号最新验证码（比较 inbox 与 junkemail 最新一封）。"""
+    account = get_account_by_id(account_id)
+    if not account:
+        return jsonify({'success': False, 'error': '账号不存在'}), 404
+
+    if account.get('status') != 'active':
+        return jsonify({'success': False, 'error': '账号当前不可用'}), 403
+
+    result = get_latest_verification_code_result(account)
+    if not result.get('success'):
+        return jsonify({'success': False, 'error': result.get('message', '提取失败'), 'details': result.get('details')}), result.get('status', 404)
+
+    return jsonify({'success': True, 'data': result['data']})
 
 
 @app.route('/api/accounts', methods=['POST'])
@@ -5935,7 +6107,7 @@ def api_external_message_raw(message_id):
 @api_key_required
 def api_external_verification_code():
     """提取验证码。"""
-    params, error = parse_external_mail_request(default_top=10, default_since_minutes=DEFAULT_VERIFICATION_LOOKBACK_MINUTES)
+    params, error = parse_external_mail_request(default_top=10, default_since_minutes=None)
     if error:
         return external_error(*error)
 
@@ -5947,38 +6119,24 @@ def api_external_verification_code():
     code_regex = request.args.get('code_regex', '').strip()
     code_source = request.args.get('code_source', 'all').strip().lower() or 'all'
 
-    result = read_account_messages(
+    result = get_latest_verification_code_result(
         account,
-        folder=params['folder'],
-        skip=0,
-        top=min(10, EXTERNAL_MAX_MESSAGES),
+        code_length=code_length,
+        code_regex=code_regex,
+        code_source=code_source,
         from_contains=params['from_contains'],
         subject_contains=params['subject_contains'],
-        since_minutes=params['since_minutes'],
-        prefer_scan=True
+        since_minutes=params['since_minutes']
     )
     if not result.get('success'):
-        return external_result_or_error(result)
+        return external_error(
+            result.get('code', 'VERIFICATION_CODE_NOT_FOUND'),
+            result.get('message', '未提取到高置信度验证码'),
+            result.get('status', 404),
+            result.get('details')
+        )
 
-    for summary in result.get('emails', []):
-        detail_result = read_account_message_detail(account, summary['id'], params['folder'])
-        if not detail_result.get('success'):
-            continue
-        detail = detail_result['email']
-        code = extract_verification_code(detail, code_length, code_regex, code_source)
-        if code:
-            return external_success({
-                'email': params['email'],
-                'folder': params['folder'],
-                'code': code,
-                'message_id': detail['id'],
-                'subject': detail.get('subject', ''),
-                'from_address': detail.get('from_address', ''),
-                'timestamp': detail.get('timestamp', ''),
-                'method': detail.get('method', '')
-            })
-
-    return external_error('VERIFICATION_CODE_NOT_FOUND', '未提取到高置信度验证码', 404)
+    return external_success(result['data'])
 
 
 @app.route('/api/external/verification-link', methods=['GET'])
