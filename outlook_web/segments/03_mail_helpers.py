@@ -1075,11 +1075,17 @@ def parse_email_datetime(value: str) -> Optional[datetime]:
     if not value:
         return None
     try:
-        if 'T' in str(value):
-            normalized = str(value).replace('Z', '+00:00')
+        raw_value = str(value).strip()
+        # IMAP Date headers may include a trailing label like "(UTC)",
+        # which parsedate_to_datetime cannot always parse directly.
+        if raw_value.endswith(')') and ' (' in raw_value:
+            raw_value = raw_value[:raw_value.rfind(' (')].strip()
+
+        if 'T' in raw_value:
+            normalized = raw_value.replace('Z', '+00:00')
             dt = datetime.fromisoformat(normalized)
         else:
-            dt = parsedate_to_datetime(str(value))
+            dt = parsedate_to_datetime(raw_value)
         if dt.tzinfo is not None:
             return dt.astimezone().replace(tzinfo=None)
         return dt

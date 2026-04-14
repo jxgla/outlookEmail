@@ -110,6 +110,26 @@ def mock_read_account_messages(account, folder="inbox", **kwargs):
     }
 
 
+def mock_read_account_messages_rfc822_utc(account, folder="inbox", **kwargs):
+    messages = {
+        "inbox": {
+            "id": "msg-inbox-rfc822",
+            "date": "Wed, 08 Apr 2026 15:01:42 +0000 (UTC)",
+            "subject": "Inbox verification code",
+        },
+        "junkemail": {
+            "id": "msg-junk-rfc822",
+            "date": "Mon, 13 Apr 2026 16:21:15 +0000 (UTC)",
+            "subject": "Junk verification code",
+        },
+    }
+    return {
+        "success": True,
+        "method": "mock",
+        "emails": [messages[folder]],
+    }
+
+
 def mock_read_account_message_detail(account, message_id, folder="inbox"):
     details = {
         "msg-inbox": {
@@ -128,6 +148,33 @@ def mock_read_account_message_detail(account, message_id, folder="inbox"):
             "html_content": "",
             "from_address": "sender@example.com",
             "timestamp": "2026-04-10T10:00:00+00:00",
+            "method": "mock",
+        },
+    }
+    return {
+        "success": True,
+        "email": details[message_id],
+    }
+
+
+def mock_read_account_message_detail_rfc822_utc(account, message_id, folder="inbox"):
+    details = {
+        "msg-inbox-rfc822": {
+            "id": "msg-inbox-rfc822",
+            "subject": "Inbox verification code",
+            "content": "Your verification code is 111111.",
+            "html_content": "",
+            "from_address": "sender@example.com",
+            "timestamp": "Wed, 08 Apr 2026 15:01:42 +0000 (UTC)",
+            "method": "mock",
+        },
+        "msg-junk-rfc822": {
+            "id": "msg-junk-rfc822",
+            "subject": "Junk verification code",
+            "content": "Your verification code is 654321.",
+            "html_content": "",
+            "from_address": "sender@example.com",
+            "timestamp": "Mon, 13 Apr 2026 16:21:15 +0000 (UTC)",
             "method": "mock",
         },
     }
@@ -410,6 +457,23 @@ class LatestVerificationCodeTests(unittest.TestCase):
         self.assertEqual(payload["data"]["code"], "654321")
         self.assertEqual(payload["data"]["selected_folder"], "junkemail")
         self.assertEqual(since_minutes_seen, [("inbox", None), ("junkemail", None)])
+
+    def test_external_verification_code_prefers_newer_rfc822_utc_junk_message(self):
+        with patch.object(app_module, "get_external_api_key", return_value="test-key"), \
+             patch.object(app_module, "get_account_by_email", return_value=ACTIVE_ACCOUNT), \
+             patch.object(app_module, "read_account_messages", side_effect=mock_read_account_messages_rfc822_utc), \
+             patch.object(app_module, "read_account_message_detail", side_effect=mock_read_account_message_detail_rfc822_utc):
+            response = self.client.get(
+                "/api/external/verification-code?email=user@outlook.com",
+                headers={"X-API-Key": "test-key"},
+            )
+
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["data"]["code"], "654321")
+        self.assertEqual(payload["data"]["selected_folder"], "junkemail")
 
     def test_external_verification_code_only_uses_newest_of_inbox_and_junk(self):
         with patch.object(app_module, "get_external_api_key", return_value="test-key"), \
