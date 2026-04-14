@@ -866,8 +866,7 @@ def trigger_refresh_internal():
         conn.execute("DELETE FROM account_refresh_logs WHERE created_at < datetime('now', '-6 months')")
         conn.commit()
 
-        cursor = conn.execute("SELECT id, email, client_id, refresh_token, group_id FROM accounts WHERE status = 'active' AND COALESCE(account_type, 'outlook') = 'outlook'")
-        accounts = cursor.fetchall()
+        accounts = load_refresh_target_accounts(conn)
 
         total = len(accounts)
         success_count = 0
@@ -888,12 +887,14 @@ def trigger_refresh_internal():
                     INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message)
                     VALUES (?, ?, ?, ?, ?)
                 ''', (account_id, account_email, 'scheduled', 'failed', error_msg))
+                update_account_status_by_refresh_result(conn, account_id, False)
                 conn.commit()
                 continue
 
             # 获取分组代理设置
             proxy_url = ''
             group_id = account['group_id']
+            group_row = None
             if group_id:
                 group_cursor = conn.execute(
                     'SELECT proxy_url, fallback_proxy_url_1, fallback_proxy_url_2 FROM groups WHERE id = ?',
@@ -910,13 +911,9 @@ def trigger_refresh_internal():
                 INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message)
                 VALUES (?, ?, ?, ?, ?)
             ''', (account_id, account_email, 'scheduled', 'success' if success else 'failed', error_msg))
+            update_account_status_by_refresh_result(conn, account_id, success)
 
             if success:
-                conn.execute('''
-                    UPDATE accounts
-                    SET last_refresh_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                ''', (account_id,))
                 success_count += 1
             else:
                 failed_count += 1

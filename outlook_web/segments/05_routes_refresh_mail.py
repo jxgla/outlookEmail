@@ -19,19 +19,68 @@ def log_refresh_result(account_id: int, account_email: str, refresh_type: str, s
             VALUES (?, ?, ?, ?, ?)
         ''', (account_id, account_email, refresh_type, status, error_message))
 
-        # 更新账号的最后刷新时间
-        if status == 'success':
-            db.execute('''
-                UPDATE accounts
-                SET last_refresh_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (account_id,))
+        update_account_status_by_refresh_result(db, account_id, status == 'success')
 
         db.commit()
         return True
     except Exception as e:
         print(f"记录刷新结果失败: {str(e)}")
         return False
+
+
+def update_account_status_by_refresh_result(db_conn, account_id: int, success: bool):
+    """刷新失败自动停用；刷新成功自动恢复启用。"""
+    if success:
+        db_conn.execute(
+            '''
+            UPDATE accounts
+            SET status = 'active', last_refresh_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            ''',
+            (account_id,)
+        )
+        return
+
+    db_conn.execute(
+        '''
+        UPDATE accounts
+        SET status = 'inactive', updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        ''',
+        (account_id,)
+    )
+
+
+def load_refresh_target_accounts(db_conn):
+    """获取可参与批量刷新账号：active + 最近一次刷新失败而被停用的账号。"""
+    cursor = db_conn.execute(
+        '''
+        SELECT a.id, a.email, a.client_id, a.refresh_token, a.group_id
+        FROM accounts a
+        WHERE COALESCE(a.account_type, 'outlook') = 'outlook'
+          AND (
+                a.status = 'active'
+                OR (
+                    a.status = 'inactive'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM account_refresh_logs latest
+                        WHERE latest.account_id = a.id
+                          AND latest.id = (
+                              SELECT l2.id
+                              FROM account_refresh_logs l2
+                              WHERE l2.account_id = a.id
+                              ORDER BY l2.created_at DESC, l2.id DESC
+                              LIMIT 1
+                          )
+                          AND latest.status = 'failed'
+                    )
+                )
+          )
+        ORDER BY a.id ASC
+        '''
+    )
+    return cursor.fetchall()
 
 
 def log_forwarding_result(account_id: int, account_email: str, message_id: str, channel: str,
@@ -292,8 +341,7 @@ def api_refresh_all_accounts():
             except Exception as e:
                 print(f"清理旧记录失败: {str(e)}")
 
-            cursor = conn.execute("SELECT id, email, client_id, refresh_token, group_id FROM accounts WHERE status = 'active' AND COALESCE(account_type, 'outlook') = 'outlook'")
-            accounts = cursor.fetchall()
+            accounts = load_refresh_target_accounts(conn)
 
             total = len(accounts)
             success_count = 0
@@ -326,6 +374,7 @@ def api_refresh_all_accounts():
                             INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message)
                             VALUES (?, ?, ?, ?, ?)
                         ''', (account_id, account_email, 'manual', 'failed', error_msg))
+                        update_account_status_by_refresh_result(conn, account_id, False)
                         conn.commit()
                     except Exception:
                         pass
@@ -356,14 +405,7 @@ def api_refresh_all_accounts():
                         INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message)
                         VALUES (?, ?, ?, ?, ?)
                     ''', (account_id, account_email, 'manual', 'success' if success else 'failed', error_msg))
-
-                    # 更新账号的最后刷新时间
-                    if success:
-                        conn.execute('''
-                            UPDATE accounts
-                            SET last_refresh_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                            WHERE id = ?
-                        ''', (account_id,))
+                    update_account_status_by_refresh_result(conn, account_id, success)
 
                     conn.commit()
                 except Exception as e:
@@ -416,7 +458,7 @@ def api_refresh_failed_accounts():
             GROUP BY account_id
         ) latest ON a.id = latest.account_id
         INNER JOIN account_refresh_logs l ON a.id = l.account_id AND l.created_at = latest.last_refresh
-        WHERE l.status = 'failed' AND a.status = 'active'
+        WHERE l.status = 'failed' AND COALESCE(a.account_type, 'outlook') = 'outlook'
     ''')
     accounts = cursor.fetchall()
 
@@ -523,8 +565,7 @@ def api_trigger_scheduled_refresh():
             except Exception as e:
                 print(f"清理旧记录失败: {str(e)}")
 
-            cursor = conn.execute("SELECT id, email, client_id, refresh_token, group_id FROM accounts WHERE status = 'active' AND COALESCE(account_type, 'outlook') = 'outlook'")
-            accounts = cursor.fetchall()
+            accounts = load_refresh_target_accounts(conn)
 
             total = len(accounts)
             success_count = 0
@@ -556,6 +597,7 @@ def api_trigger_scheduled_refresh():
                             INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message)
                             VALUES (?, ?, ?, ?, ?)
                         ''', (account_id, account_email, 'scheduled', 'failed', error_msg))
+                        update_account_status_by_refresh_result(conn, account_id, False)
                         conn.commit()
                     except Exception:
                         pass
@@ -583,13 +625,7 @@ def api_trigger_scheduled_refresh():
                         INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message)
                         VALUES (?, ?, ?, ?, ?)
                     ''', (account_id, account_email, 'scheduled', 'success' if success else 'failed', error_msg))
-
-                    if success:
-                        conn.execute('''
-                            UPDATE accounts
-                            SET last_refresh_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                            WHERE id = ?
-                        ''', (account_id,))
+                    update_account_status_by_refresh_result(conn, account_id, success)
 
                     conn.commit()
                 except Exception as e:
@@ -849,7 +885,8 @@ def api_get_refresh_stats():
     cursor = db.execute('''
         SELECT COUNT(*) as total_accounts
         FROM accounts
-        WHERE status = 'active'
+                WHERE COALESCE(account_type, 'outlook') = 'outlook'
+                    AND status IN ('active', 'inactive')
     ''')
     total_accounts = cursor.fetchone()['total_accounts']
 
@@ -862,7 +899,7 @@ def api_get_refresh_stats():
             GROUP BY account_id
         ) latest ON l.account_id = latest.account_id AND l.created_at = latest.last_refresh
         INNER JOIN accounts a ON l.account_id = a.id
-        WHERE l.status = 'failed' AND a.status = 'active'
+        WHERE l.status = 'failed' AND COALESCE(a.account_type, 'outlook') = 'outlook'
     ''')
     failed_count = cursor.fetchone()['failed_count']
 

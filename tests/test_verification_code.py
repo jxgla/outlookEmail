@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 
@@ -481,6 +482,121 @@ class LatestVerificationCodeTests(unittest.TestCase):
         self.assertEqual(len(payload["data"]["groups"]), 1)
         self.assertEqual(payload["data"]["groups"][0]["group_id"], 2)
         self.assertNotIn("accounts", payload["data"]["groups"][0])
+
+
+class RefreshAccountStatusTests(unittest.TestCase):
+    def setUp(self):
+        app_module.app.config["TESTING"] = True
+        app_module.app.config["WTF_CSRF_ENABLED"] = False
+        self.client = app_module.app.test_client()
+
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("DELETE FROM account_refresh_logs")
+            db.execute("DELETE FROM accounts")
+            db.commit()
+
+    def _insert_outlook_account(self, email_prefix, status="active", account_type="outlook"):
+        email = f"{email_prefix}-{uuid.uuid4().hex[:8]}@example.com"
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            encrypted_refresh_token = app_module.encrypt_data("refresh-token-for-test")
+            encrypted_password = app_module.encrypt_data("password-for-test")
+            db.execute(
+                """
+                INSERT INTO accounts (
+                    email, password, client_id, refresh_token, group_id,
+                    remark, status, account_type, provider,
+                    imap_host, imap_port, imap_password, forward_enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    encrypted_password,
+                    "test-client-id",
+                    encrypted_refresh_token,
+                    1,
+                    "",
+                    status,
+                    account_type,
+                    "outlook" if account_type == "outlook" else "custom",
+                    "outlook.live.com" if account_type == "outlook" else "imap.example.com",
+                    993,
+                    "",
+                    0,
+                ),
+            )
+            db.commit()
+            row = db.execute("SELECT id, email FROM accounts WHERE email = ?", (email,)).fetchone()
+            return row["id"], row["email"]
+
+    def test_log_refresh_result_disables_failed_and_reactivates_success(self):
+        account_id, email = self._insert_outlook_account("refresh-status")
+
+        with app_module.app.app_context():
+            app_module.log_refresh_result(account_id, email, "manual", "failed", "token invalid")
+            db = app_module.get_db()
+            row = db.execute("SELECT status FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            self.assertEqual(row["status"], "inactive")
+
+            app_module.log_refresh_result(account_id, email, "manual", "success", None)
+            row = db.execute("SELECT status, last_refresh_at FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            self.assertEqual(row["status"], "active")
+            self.assertIsNotNone(row["last_refresh_at"])
+
+    def test_load_refresh_target_accounts_includes_failed_inactive_accounts(self):
+        active_id, _ = self._insert_outlook_account("active-outlook", status="active", account_type="outlook")
+        inactive_failed_id, inactive_failed_email = self._insert_outlook_account("inactive-failed", status="inactive", account_type="outlook")
+        inactive_nonfailed_id, inactive_nonfailed_email = self._insert_outlook_account("inactive-ok", status="inactive", account_type="outlook")
+        imap_active_id, _ = self._insert_outlook_account("imap-active", status="active", account_type="imap")
+
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute(
+                "INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message) VALUES (?, ?, ?, ?, ?)",
+                (inactive_failed_id, inactive_failed_email, "manual", "failed", "x"),
+            )
+            db.execute(
+                "INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message) VALUES (?, ?, ?, ?, ?)",
+                (inactive_nonfailed_id, inactive_nonfailed_email, "manual", "success", None),
+            )
+            db.commit()
+
+            targets = app_module.load_refresh_target_accounts(db)
+            target_ids = {row["id"] for row in targets}
+
+            self.assertIn(active_id, target_ids)
+            self.assertIn(inactive_failed_id, target_ids)
+            self.assertNotIn(inactive_nonfailed_id, target_ids)
+            self.assertNotIn(imap_active_id, target_ids)
+
+    def test_refresh_failed_api_reactivates_inactive_account_on_success(self):
+        account_id, email = self._insert_outlook_account("retry-inactive", status="inactive", account_type="outlook")
+
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute(
+                "INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message) VALUES (?, ?, ?, ?, ?)",
+                (account_id, email, "manual", "failed", "token expired"),
+            )
+            db.commit()
+
+        with patch.object(app_module, "test_refresh_token", return_value=(True, None)):
+            with self.client.session_transaction() as session:
+                session["logged_in"] = True
+
+            response = self.client.post("/api/accounts/refresh-failed")
+            payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["success_count"], 1)
+        self.assertEqual(payload["failed_count"], 0)
+
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            row = db.execute("SELECT status FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            self.assertEqual(row["status"], "active")
 
 
 if __name__ == "__main__":
