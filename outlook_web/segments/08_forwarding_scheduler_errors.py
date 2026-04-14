@@ -1223,37 +1223,99 @@ def account_has_imap_otp_credentials(account: Dict[str, Any]) -> bool:
 
 
 def fetch_verification_candidates_imap(account: Dict[str, Any], folder: str, top: int = 20) -> Dict[str, Any]:
+    folder_name = normalize_folder_name(folder)
     proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+    provider = str(account.get('provider', '') or '').strip().lower()
+    oauth_client_id = str(account.get('client_id', '') or '').strip()
+    oauth_refresh_token = str(account.get('refresh_token', '') or '').strip()
+    oauth_error = None
+
+    if provider == 'outlook' and oauth_client_id and oauth_refresh_token:
+        oauth_result = get_emails_imap_with_server(
+            account['email'],
+            oauth_client_id,
+            oauth_refresh_token,
+            folder_name,
+            0,
+            top,
+            IMAP_SERVER_NEW,
+            proxy_url,
+            fallback_proxy_urls,
+        )
+        if oauth_result.get('success'):
+            formatted = format_email_items(oauth_result.get('emails', []), folder_name)
+            return {
+                'success': True,
+                'emails': [dict(item, folder=folder_name) for item in formatted],
+                'method': 'IMAP (OAuth)',
+            }
+        oauth_error = oauth_result.get('error')
+
     result = get_emails_imap_generic(
         account['email'],
         account.get('imap_password', ''),
         account.get('imap_host', ''),
         account.get('imap_port', 993),
-        folder,
+        folder_name,
         account.get('provider', 'custom'),
         0,
         top,
         proxy_url,
     )
     if not result.get('success'):
-        return result
+        return {
+            'success': False,
+            'error': oauth_error or result.get('error') or '获取邮件失败',
+        }
 
     return {
         'success': True,
-        'emails': [dict(item, folder=folder) for item in result.get('emails', [])],
+        'emails': [dict(item, folder=folder_name) for item in result.get('emails', [])],
         'method': result.get('method', 'IMAP (Generic)'),
     }
 
 
 def fetch_verification_detail_imap(account: Dict[str, Any], message_id: str, folder: str = 'inbox') -> Dict[str, Any]:
+    folder_name = normalize_folder_name(folder)
     proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+    provider = str(account.get('provider', '') or '').strip().lower()
+    oauth_client_id = str(account.get('client_id', '') or '').strip()
+    oauth_refresh_token = str(account.get('refresh_token', '') or '').strip()
+
+    if provider == 'outlook' and oauth_client_id and oauth_refresh_token:
+        oauth_detail = get_email_detail_imap(
+            account['email'],
+            oauth_client_id,
+            oauth_refresh_token,
+            message_id,
+            folder_name,
+            proxy_url,
+            fallback_proxy_urls,
+        )
+        if oauth_detail:
+            body = str(oauth_detail.get('body', '') or '')
+            return {
+                'success': True,
+                'email': {
+                    'id': str(oauth_detail.get('id', '') or message_id),
+                    'subject': oauth_detail.get('subject', '无主题'),
+                    'content': strip_html_content(body),
+                    'html_content': '',
+                    'from_address': oauth_detail.get('from', '未知'),
+                    'timestamp': oauth_detail.get('date', ''),
+                    'method': 'IMAP (OAuth)',
+                }
+            }
+
     result = get_email_detail_imap_generic_result(
         account['email'],
         account.get('imap_password', ''),
         account.get('imap_host', ''),
         account.get('imap_port', 993),
         message_id,
-        folder,
+        folder_name,
         account.get('provider', 'custom'),
         proxy_url,
     )

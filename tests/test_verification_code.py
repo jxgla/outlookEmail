@@ -39,6 +39,19 @@ IMAP_ACCOUNT = {
     "imap_port": 993,
 }
 
+OAUTH_IMAP_ACCOUNT = {
+    "id": 4,
+    "email": "oauth-imap-user@outlook.com",
+    "status": "active",
+    "account_type": "imap",
+    "provider": "outlook",
+    "client_id": "oauth-client-id",
+    "refresh_token": "oauth-refresh-token",
+    "imap_host": "outlook.live.com",
+    "imap_password": "unused-in-oauth-imap",
+    "imap_port": 993,
+}
+
 GROUP_RECORD = {
     "id": 2,
     "name": "注册组",
@@ -171,6 +184,53 @@ def mock_get_email_detail_imap_generic_result(email_addr, imap_password, imap_ho
     }
 
 
+def mock_get_emails_imap_with_server(account, client_id, refresh_token, folder="inbox", skip=0, top=20, server="", proxy_url=None, fallback_proxy_urls=None):
+    messages = {
+        "inbox": {
+            "id": "oauth-imap-inbox",
+            "date": "2026-04-10T09:00:00+00:00",
+            "subject": "OAuth IMAP inbox verification code",
+            "body_preview": "Inbox code 777777",
+        },
+        "junkemail": {
+            "id": "oauth-imap-junk",
+            "date": "2026-04-10T10:00:00+00:00",
+            "subject": "OAuth IMAP junk verification code",
+            "body_preview": "Junk code 888888",
+        },
+    }
+    return {
+        "success": True,
+        "emails": [messages[folder]],
+        "method": "IMAP (OAuth)",
+        "has_more": False,
+    }
+
+
+def mock_get_email_detail_imap(account, client_id, refresh_token, message_id, folder="inbox", proxy_url=None, fallback_proxy_urls=None):
+    details = {
+        "oauth-imap-inbox": {
+            "id": "oauth-imap-inbox",
+            "subject": "OAuth IMAP inbox verification code",
+            "from": "sender@example.com",
+            "to": "oauth-imap-user@outlook.com",
+            "cc": "",
+            "date": "2026-04-10T09:00:00+00:00",
+            "body": "Your verification code is 777777.",
+        },
+        "oauth-imap-junk": {
+            "id": "oauth-imap-junk",
+            "subject": "OAuth IMAP junk verification code",
+            "from": "sender@example.com",
+            "to": "oauth-imap-user@outlook.com",
+            "cc": "",
+            "date": "2026-04-10T10:00:00+00:00",
+            "body": "Your verification code is 888888.",
+        },
+    }
+    return details[message_id]
+
+
 class LatestVerificationCodeTests(unittest.TestCase):
     def setUp(self):
         app_module.app.config["TESTING"] = True
@@ -219,6 +279,34 @@ class LatestVerificationCodeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["success"])
         self.assertEqual(payload["data"]["code"], "654321")
+        self.assertEqual(payload["data"]["selected_folder"], "junkemail")
+
+    @patch.object(app_module, "get_account_by_id", return_value=OAUTH_IMAP_ACCOUNT)
+    @patch.object(app_module, "get_emails_imap_with_server", side_effect=mock_get_emails_imap_with_server)
+    @patch.object(app_module, "get_email_detail_imap", side_effect=mock_get_email_detail_imap)
+    @patch.object(app_module, "get_emails_imap_generic", side_effect=AssertionError("get_emails_imap_generic should not be used for Outlook OAuth IMAP accounts"))
+    @patch.object(app_module, "get_email_detail_imap_generic_result", side_effect=AssertionError("get_email_detail_imap_generic_result should not be used for Outlook OAuth IMAP accounts"))
+    @patch.object(app_module, "read_account_messages", side_effect=AssertionError("read_account_messages should not be used for IMAP OTP accounts"))
+    @patch.object(app_module, "read_account_message_detail", side_effect=AssertionError("read_account_message_detail should not be used for IMAP OTP accounts"))
+    def test_internal_route_uses_oauth_imap_for_outlook_imap_account(
+        self,
+        _mock_detail_router,
+        _mock_messages_router,
+        _mock_generic_detail,
+        _mock_generic_messages,
+        _mock_oauth_detail,
+        _mock_oauth_messages,
+        _mock_account,
+    ):
+        with self.client.session_transaction() as session:
+            session["logged_in"] = True
+
+        response = self.client.get("/api/accounts/4/latest-verification-code")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["data"]["code"], "888888")
         self.assertEqual(payload["data"]["selected_folder"], "junkemail")
 
     @patch.object(app_module, "get_external_api_key", return_value="test-key")
