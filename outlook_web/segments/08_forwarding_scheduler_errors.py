@@ -1340,10 +1340,11 @@ def fetch_verification_detail_imap(account: Dict[str, Any], message_id: str, fol
 
 
 def find_latest_verification_code(account: Dict[str, Any], since_minutes: Optional[int] = None) -> Dict[str, Any]:
+    use_imap_path = account_has_imap_otp_credentials(account)
     candidates = []
     errors = []
     for folder in ('inbox', 'junkemail'):
-        if account_has_imap_otp_credentials(account):
+        if use_imap_path:
             result = fetch_verification_candidates_imap(account, folder)
         else:
             fetch_kwargs = {}
@@ -1369,27 +1370,37 @@ def find_latest_verification_code(account: Dict[str, Any], since_minutes: Option
         reverse=True,
     )
 
-    selected = candidates[0]
-    if account_has_imap_otp_credentials(account):
-        detail_result = fetch_verification_detail_imap(
-            account,
-            str(selected.get('id', '')),
-            folder=selected.get('folder', 'inbox'),
-        )
-    else:
-        detail_result = read_account_message_detail(account, str(selected.get('id', '')), folder=selected.get('folder', 'inbox'))
-    if not detail_result.get('success'):
-        return {'success': False, 'error': detail_result.get('error') or '获取邮件详情失败'}
+    selected = None
+    code = ''
+    for candidate in candidates:
+        if use_imap_path:
+            detail_result = fetch_verification_detail_imap(
+                account,
+                str(candidate.get('id', '')),
+                folder=candidate.get('folder', 'inbox'),
+            )
+        else:
+            detail_result = read_account_message_detail(
+                account,
+                str(candidate.get('id', '')),
+                folder=candidate.get('folder', 'inbox'),
+            )
+        if not detail_result.get('success'):
+            continue
 
-    email_detail = detail_result.get('email') or {}
-    joined_text = '\n'.join([
-        str(selected.get('subject', '') or ''),
-        str(email_detail.get('subject', '') or ''),
-        str(email_detail.get('content', '') or ''),
-        strip_html_content(str(email_detail.get('html_content', '') or '')),
-    ])
-    code = extract_verification_code(joined_text)
-    if not code:
+        email_detail = detail_result.get('email') or {}
+        joined_text = '\n'.join([
+            str(candidate.get('subject', '') or ''),
+            str(email_detail.get('subject', '') or ''),
+            str(email_detail.get('content', '') or ''),
+            strip_html_content(str(email_detail.get('html_content', '') or '')),
+        ])
+        code = extract_verification_code(joined_text)
+        if code:
+            selected = candidate
+            break
+
+    if not selected:
         return {'success': False, 'error': '未提取到验证码'}
 
     return {

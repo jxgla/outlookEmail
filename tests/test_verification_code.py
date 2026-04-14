@@ -136,6 +136,56 @@ def mock_read_account_message_detail(account, message_id, folder="inbox"):
     }
 
 
+def mock_read_account_messages_latest_not_code(account, folder="inbox", **kwargs):
+    messages = {
+        "inbox": [
+            {
+                "id": "msg-latest-no-code",
+                "date": "2026-04-10T10:30:00+00:00",
+                "subject": "Security alert",
+            },
+            {
+                "id": "msg-older-with-code",
+                "date": "2026-04-10T10:00:00+00:00",
+                "subject": "Your verification code",
+            },
+        ],
+        "junkemail": [],
+    }
+    return {
+        "success": True,
+        "method": "mock",
+        "emails": messages[folder],
+    }
+
+
+def mock_read_account_message_detail_latest_not_code(account, message_id, folder="inbox"):
+    details = {
+        "msg-latest-no-code": {
+            "id": "msg-latest-no-code",
+            "subject": "Security alert",
+            "content": "There was a login attempt from a new device.",
+            "html_content": "",
+            "from_address": "security@example.com",
+            "timestamp": "2026-04-10T10:30:00+00:00",
+            "method": "mock",
+        },
+        "msg-older-with-code": {
+            "id": "msg-older-with-code",
+            "subject": "Your verification code",
+            "content": "Your verification code is 123456.",
+            "html_content": "",
+            "from_address": "sender@example.com",
+            "timestamp": "2026-04-10T10:00:00+00:00",
+            "method": "mock",
+        },
+    }
+    return {
+        "success": True,
+        "email": details[message_id],
+    }
+
+
 def mock_get_emails_imap_generic(email_addr, imap_password, imap_host, imap_port=993, folder="inbox", provider="custom", skip=0, top=20, proxy_url=""):
     messages = {
         "inbox": {
@@ -359,6 +409,23 @@ class LatestVerificationCodeTests(unittest.TestCase):
         self.assertEqual(payload["data"]["code"], "654321")
         self.assertEqual(payload["data"]["selected_folder"], "junkemail")
         self.assertEqual(since_minutes_seen, [("inbox", None), ("junkemail", None)])
+
+    def test_external_verification_code_scans_older_candidates_when_latest_has_no_code(self):
+        with patch.object(app_module, "get_external_api_key", return_value="test-key"), \
+             patch.object(app_module, "get_account_by_email", return_value=ACTIVE_ACCOUNT), \
+             patch.object(app_module, "read_account_messages", side_effect=mock_read_account_messages_latest_not_code), \
+             patch.object(app_module, "read_account_message_detail", side_effect=mock_read_account_message_detail_latest_not_code):
+            response = self.client.get(
+                "/api/external/verification-code?email=user@outlook.com",
+                headers={"X-API-Key": "test-key"},
+            )
+
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["data"]["code"], "123456")
+        self.assertEqual(payload["data"]["selected_message_id"], "msg-older-with-code")
 
     def test_external_pool_groups_returns_group_detail_with_accounts(self):
         with patch.object(app_module, "get_external_api_key", return_value="test-key"), \
