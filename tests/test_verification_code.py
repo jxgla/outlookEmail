@@ -411,7 +411,7 @@ class LatestVerificationCodeTests(unittest.TestCase):
         self.assertEqual(payload["data"]["selected_folder"], "junkemail")
         self.assertEqual(since_minutes_seen, [("inbox", None), ("junkemail", None)])
 
-    def test_external_verification_code_scans_older_candidates_when_latest_has_no_code(self):
+    def test_external_verification_code_only_uses_newest_of_inbox_and_junk(self):
         with patch.object(app_module, "get_external_api_key", return_value="test-key"), \
              patch.object(app_module, "get_account_by_email", return_value=ACTIVE_ACCOUNT), \
              patch.object(app_module, "read_account_messages", side_effect=mock_read_account_messages_latest_not_code), \
@@ -423,10 +423,9 @@ class LatestVerificationCodeTests(unittest.TestCase):
 
         payload = response.get_json()
 
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(payload["success"])
-        self.assertEqual(payload["data"]["code"], "123456")
-        self.assertEqual(payload["data"]["selected_message_id"], "msg-older-with-code")
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error"], "未提取到验证码")
 
     def test_external_pool_groups_returns_group_detail_with_accounts(self):
         with patch.object(app_module, "get_external_api_key", return_value="test-key"), \

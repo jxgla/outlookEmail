@@ -1219,6 +1219,17 @@ def account_has_imap_otp_credentials(account: Dict[str, Any]) -> bool:
     return (str(account.get('account_type', '') or '').strip().lower() == 'imap')
 
 
+def can_attempt_imap_otp(account: Dict[str, Any]) -> bool:
+    account_type = str(account.get('account_type', '') or '').strip().lower()
+    if account_type == 'imap':
+        return True
+    imap_password = str(account.get('imap_password', '') or '').strip()
+    imap_host = str(account.get('imap_host', '') or '').strip()
+    oauth_client_id = str(account.get('client_id', '') or '').strip()
+    oauth_refresh_token = str(account.get('refresh_token', '') or '').strip()
+    return bool((imap_password and imap_host) or (oauth_client_id and oauth_refresh_token))
+
+
 def fetch_verification_candidates_imap(account: Dict[str, Any], folder: str, top: int = 20) -> Dict[str, Any]:
     folder_name = normalize_folder_name(folder)
     proxy_url = get_account_proxy_url(account)
@@ -1337,24 +1348,41 @@ def fetch_verification_detail_imap(account: Dict[str, Any], message_id: str, fol
 
 
 def find_latest_verification_code(account: Dict[str, Any], since_minutes: Optional[int] = None) -> Dict[str, Any]:
-    use_imap_path = account_has_imap_otp_credentials(account)
+    prefer_imap_path = account_has_imap_otp_credentials(account)
+    allow_imap_fallback = can_attempt_imap_otp(account)
     candidates = []
     errors = []
     for folder in ('inbox', 'junkemail'):
-        if use_imap_path:
-            result = fetch_verification_candidates_imap(account, folder)
+        primary_source = 'imap' if prefer_imap_path else 'graph'
+        fallback_source = 'graph' if primary_source == 'imap' else 'imap'
+
+        if primary_source == 'imap':
+            result = fetch_verification_candidates_imap(account, folder, top=1)
         else:
-            fetch_kwargs = {}
+            fetch_kwargs = {'skip': 0, 'top': 1}
             if since_minutes is not None:
                 fetch_kwargs['since_minutes'] = since_minutes
             result = read_account_messages(account, folder=folder, **fetch_kwargs)
 
+        if (not result.get('success')) and fallback_source == 'imap' and allow_imap_fallback:
+            result = fetch_verification_candidates_imap(account, folder, top=1)
+            primary_source = 'imap'
+        elif (not result.get('success')) and fallback_source == 'graph':
+            fetch_kwargs = {'skip': 0, 'top': 1}
+            if since_minutes is not None:
+                fetch_kwargs['since_minutes'] = since_minutes
+            result = read_account_messages(account, folder=folder, **fetch_kwargs)
+            primary_source = 'graph'
+
         if not result.get('success'):
             errors.append(result.get('error') or '获取邮件失败')
             continue
-        for item in result.get('emails', []):
-            candidate = dict(item or {})
+
+        folder_emails = result.get('emails', []) or []
+        if folder_emails:
+            candidate = dict(folder_emails[0] or {})
             candidate['folder'] = folder
+            candidate['_otp_source'] = primary_source
             candidates.append(candidate)
 
     if not candidates:
@@ -1367,37 +1395,46 @@ def find_latest_verification_code(account: Dict[str, Any], since_minutes: Option
         reverse=True,
     )
 
-    selected = None
-    code = ''
-    for candidate in candidates:
-        if use_imap_path:
-            detail_result = fetch_verification_detail_imap(
-                account,
-                str(candidate.get('id', '')),
-                folder=candidate.get('folder', 'inbox'),
-            )
-        else:
+    selected = candidates[0]
+    selected_source = str(selected.get('_otp_source', '') or '').strip().lower()
+    if selected_source == 'imap':
+        detail_result = fetch_verification_detail_imap(
+            account,
+            str(selected.get('id', '')),
+            folder=selected.get('folder', 'inbox'),
+        )
+        if not detail_result.get('success'):
             detail_result = read_account_message_detail(
                 account,
-                str(candidate.get('id', '')),
-                folder=candidate.get('folder', 'inbox'),
+                str(selected.get('id', '')),
+                folder=selected.get('folder', 'inbox'),
             )
-        if not detail_result.get('success'):
-            continue
+    else:
+        detail_result = read_account_message_detail(
+            account,
+            str(selected.get('id', '')),
+            folder=selected.get('folder', 'inbox'),
+        )
+        if (not detail_result.get('success')) and allow_imap_fallback:
+            detail_result = fetch_verification_detail_imap(
+                account,
+                str(selected.get('id', '')),
+                folder=selected.get('folder', 'inbox'),
+            )
 
-        email_detail = detail_result.get('email') or {}
-        joined_text = '\n'.join([
-            str(candidate.get('subject', '') or ''),
-            str(email_detail.get('subject', '') or ''),
-            str(email_detail.get('content', '') or ''),
-            strip_html_content(str(email_detail.get('html_content', '') or '')),
-        ])
-        code = extract_verification_code(joined_text)
-        if code:
-            selected = candidate
-            break
+    if not detail_result.get('success'):
+        return {'success': False, 'error': detail_result.get('error') or '获取邮件详情失败'}
 
-    if not selected:
+    email_detail = detail_result.get('email') or {}
+    joined_text = '\n'.join([
+        str(selected.get('subject', '') or ''),
+        str(email_detail.get('subject', '') or ''),
+        str(email_detail.get('content', '') or ''),
+        strip_html_content(str(email_detail.get('html_content', '') or '')),
+    ])
+    code = extract_verification_code(joined_text)
+
+    if not code:
         return {'success': False, 'error': '未提取到验证码'}
 
     return {
