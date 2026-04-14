@@ -23,9 +23,11 @@ admin123
 5. 在 `main` 上打正式标签，例如 `v1.0.0`
 6. 手动触发 GitHub Actions 的 `Create GitHub Release` 工作流，并传入版本号
 
-推送 `v*` 标签后，GitHub Actions 会自动：
+GitHub Actions 会自动构建并发布 Docker 镜像（GHCR）：
 
-- 发布 Docker 镜像
+- 推送 `main` / `master` / `dev`（仅代码相关路径变更）
+- 手动触发 `Build and Push Docker Image`
+- 由发布工作流调用（发布版本时）
 
 GitHub Release 和 Windows `exe` 压缩包改为手动触发：
 
@@ -35,9 +37,11 @@ GitHub Release 和 Windows `exe` 压缩包改为手动触发：
 
 Docker 镜像标签约定：
 
-- `ghcr.io/assast/outlookemail:latest`：默认稳定版（来自默认分支）
-- `ghcr.io/assast/outlookemail:dev`：开发分支最新构建
-- `ghcr.io/assast/outlookemail:v1.0.0`：正式版本镜像（例如 v1.0.0）
+- `ghcr.io/<owner>/outlookemail:latest`：默认稳定版（默认分支）
+- `ghcr.io/<owner>/outlookemail:dev`：开发分支最新构建
+- `ghcr.io/<owner>/outlookemail:v1.0.0`：发布版本镜像（例如 v1.0.0）
+
+其中 `<owner>` 为 GitHub 仓库所有者。例如仓库是 `jxgla/outlookEmail` 时，镜像地址为 `ghcr.io/jxgla/outlookemail:*`。
 
 ### 方式一：下载 Windows `exe`(win可用)
 
@@ -57,8 +61,8 @@ Docker 镜像标签约定：
 ### 方式二：使用 Docker（推荐服务器部署）
 
 ```bash
-# 拉取最新镜像
-docker pull ghcr.io/assast/outlookemail:latest
+# 拉取最新镜像（按你的 GitHub 仓库 owner 替换）
+docker pull ghcr.io/jxgla/outlookemail:latest
 
 # 运行容器
 docker run -d \
@@ -67,7 +71,7 @@ docker run -d \
   -v $(pwd)/data:/app/data \
   -e LOGIN_PASSWORD=admin123 \
   -e SECRET_KEY=your-secret-key-here \
-  ghcr.io/assast/outlookemail:latest
+  ghcr.io/jxgla/outlookemail:latest
 ```
 
 ### 方式三：使用 Python 直接运行
@@ -89,7 +93,7 @@ python web_outlook_app.py
 version: '3.8'
 services:
   outlook-mail-reader:
-    image: ghcr.io/assast/outlookemail:latest
+    image: ghcr.io/jxgla/outlookemail:latest
     container_name: outlook-mail-reader
     ports:
       - "5000:5000"
@@ -107,6 +111,14 @@ docker-compose up -d
 ```
 
 ## ✨ 功能特性
+
+### 本次迁移重点（2026-04）
+
+- 新增内部接口：`GET /api/accounts/<id>/latest-verification-code`
+- 新增对外接口：`GET /api/external/verification-code`
+- 新增对外接口：`GET /api/external/pool/groups`（支持 `group_id` 查询详情）
+- 修复 `email_matches_filters()` 中 Graph 路径关键词过滤逻辑，避免详情抓取分支不可达
+- 统一验证码提取逻辑：同时读取 `inbox` + `junkemail`，按最新邮件提取 6 位验证码
 
 ### 邮件读取方式
 
