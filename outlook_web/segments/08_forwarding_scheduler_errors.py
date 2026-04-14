@@ -1218,14 +1218,82 @@ def extract_verification_code(content: str) -> str:
     return match.group(1) if match else ''
 
 
+def account_has_imap_otp_credentials(account: Dict[str, Any]) -> bool:
+    return bool(
+        str(account.get('imap_host', '') or '').strip()
+        and str(account.get('imap_password', '') or '').strip()
+    )
+
+
+def fetch_verification_candidates_imap(account: Dict[str, Any], folder: str, top: int = 20) -> Dict[str, Any]:
+    proxy_url = get_account_proxy_url(account)
+    result = get_emails_imap_generic(
+        account['email'],
+        account.get('imap_password', ''),
+        account.get('imap_host', ''),
+        account.get('imap_port', 993),
+        folder,
+        account.get('provider', 'custom'),
+        0,
+        top,
+        proxy_url,
+    )
+    if not result.get('success'):
+        return result
+
+    return {
+        'success': True,
+        'emails': [dict(item, folder=folder) for item in result.get('emails', [])],
+        'method': result.get('method', 'IMAP (Generic)'),
+    }
+
+
+def fetch_verification_detail_imap(account: Dict[str, Any], message_id: str, folder: str = 'inbox') -> Dict[str, Any]:
+    proxy_url = get_account_proxy_url(account)
+    result = get_email_detail_imap_generic_result(
+        account['email'],
+        account.get('imap_password', ''),
+        account.get('imap_host', ''),
+        account.get('imap_port', 993),
+        message_id,
+        folder,
+        account.get('provider', 'custom'),
+        proxy_url,
+    )
+    if not result.get('success'):
+        return result
+
+    email_detail = result.get('email') or {}
+    body = str(email_detail.get('body', '') or '')
+    body_type = str(email_detail.get('body_type', 'text') or 'text').lower()
+    return {
+        'success': True,
+        'email': {
+            'id': str(email_detail.get('id', '') or message_id),
+            'subject': email_detail.get('subject', '无主题'),
+            'content': strip_html_content(body),
+            'html_content': body if body_type == 'html' else '',
+            'from_address': email_detail.get('from', '未知'),
+            'timestamp': email_detail.get('date', ''),
+            'method': 'IMAP',
+        }
+    }
+
+
 def find_latest_verification_code(account: Dict[str, Any], since_minutes: Optional[int] = None) -> Dict[str, Any]:
     candidates = []
+    errors = []
     for folder in ('inbox', 'junkemail'):
-        fetch_kwargs = {}
-        if since_minutes is not None:
-            fetch_kwargs['since_minutes'] = since_minutes
-        result = read_account_messages(account, folder=folder, **fetch_kwargs)
+        if account_has_imap_otp_credentials(account):
+            result = fetch_verification_candidates_imap(account, folder)
+        else:
+            fetch_kwargs = {}
+            if since_minutes is not None:
+                fetch_kwargs['since_minutes'] = since_minutes
+            result = read_account_messages(account, folder=folder, **fetch_kwargs)
+
         if not result.get('success'):
+            errors.append(result.get('error') or '获取邮件失败')
             continue
         for item in result.get('emails', []):
             candidate = dict(item or {})
@@ -1233,6 +1301,8 @@ def find_latest_verification_code(account: Dict[str, Any], since_minutes: Option
             candidates.append(candidate)
 
     if not candidates:
+        if errors:
+            return {'success': False, 'error': errors[0]}
         return {'success': False, 'error': '未找到邮件'}
 
     candidates.sort(
@@ -1241,7 +1311,14 @@ def find_latest_verification_code(account: Dict[str, Any], since_minutes: Option
     )
 
     selected = candidates[0]
-    detail_result = read_account_message_detail(account, str(selected.get('id', '')), folder=selected.get('folder', 'inbox'))
+    if account_has_imap_otp_credentials(account):
+        detail_result = fetch_verification_detail_imap(
+            account,
+            str(selected.get('id', '')),
+            folder=selected.get('folder', 'inbox'),
+        )
+    else:
+        detail_result = read_account_message_detail(account, str(selected.get('id', '')), folder=selected.get('folder', 'inbox'))
     if not detail_result.get('success'):
         return {'success': False, 'error': detail_result.get('error') or '获取邮件详情失败'}
 

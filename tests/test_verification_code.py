@@ -24,6 +24,17 @@ ACTIVE_ACCOUNT = {
     "status": "active",
 }
 
+IMAP_ACCOUNT = {
+    "id": 3,
+    "email": "imap-user@example.com",
+    "status": "active",
+    "account_type": "imap",
+    "provider": "custom",
+    "imap_host": "imap.example.com",
+    "imap_password": "imap-secret",
+    "imap_port": 993,
+}
+
 GROUP_RECORD = {
     "id": 2,
     "name": "注册组",
@@ -108,6 +119,54 @@ def mock_read_account_message_detail(account, message_id, folder="inbox"):
     }
 
 
+def mock_get_emails_imap_generic(email_addr, imap_password, imap_host, imap_port=993, folder="inbox", provider="custom", skip=0, top=20, proxy_url=""):
+    messages = {
+        "inbox": {
+            "id": "imap-inbox",
+            "date": "2026-04-10T09:00:00+00:00",
+            "subject": "IMAP inbox verification code",
+            "body_preview": "Inbox code 111111",
+        },
+        "junkemail": {
+            "id": "imap-junk",
+            "date": "2026-04-10T10:00:00+00:00",
+            "subject": "IMAP junk verification code",
+            "body_preview": "Junk code 654321",
+        },
+    }
+    return {
+        "success": True,
+        "emails": [messages[folder]],
+        "method": "IMAP (Generic)",
+        "has_more": False,
+    }
+
+
+def mock_get_email_detail_imap_generic_result(email_addr, imap_password, imap_host, imap_port=993, message_id="", folder="inbox", provider="custom", proxy_url=""):
+    details = {
+        "imap-inbox": {
+            "id": "imap-inbox",
+            "subject": "IMAP inbox verification code",
+            "body": "Your verification code is 111111.",
+            "body_type": "text",
+            "from": "sender@example.com",
+            "date": "2026-04-10T09:00:00+00:00",
+        },
+        "imap-junk": {
+            "id": "imap-junk",
+            "subject": "IMAP junk verification code",
+            "body": "Your verification code is 654321.",
+            "body_type": "text",
+            "from": "sender@example.com",
+            "date": "2026-04-10T10:00:00+00:00",
+        },
+    }
+    return {
+        "success": True,
+        "email": details[message_id],
+    }
+
+
 class LatestVerificationCodeTests(unittest.TestCase):
     def setUp(self):
         app_module.app.config["TESTING"] = True
@@ -133,6 +192,57 @@ class LatestVerificationCodeTests(unittest.TestCase):
         self.assertEqual(payload["data"]["code"], "654321")
         self.assertEqual(payload["data"]["selected_folder"], "junkemail")
         self.assertEqual(payload["data"]["candidates"][0]["folder"], "junkemail")
+
+    @patch.object(app_module, "get_account_by_id", return_value=IMAP_ACCOUNT)
+    @patch.object(app_module, "get_emails_imap_generic", side_effect=mock_get_emails_imap_generic)
+    @patch.object(app_module, "get_email_detail_imap_generic_result", side_effect=mock_get_email_detail_imap_generic_result)
+    @patch.object(app_module, "read_account_messages", side_effect=AssertionError("read_account_messages should not be used for IMAP OTP accounts"))
+    @patch.object(app_module, "read_account_message_detail", side_effect=AssertionError("read_account_message_detail should not be used for IMAP OTP accounts"))
+    def test_internal_route_uses_imap_first_for_imap_account(
+        self,
+        _mock_detail_router,
+        _mock_messages_router,
+        _mock_imap_detail,
+        _mock_imap_messages,
+        _mock_account,
+    ):
+        with self.client.session_transaction() as session:
+            session["logged_in"] = True
+
+        response = self.client.get("/api/accounts/3/latest-verification-code")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["data"]["code"], "654321")
+        self.assertEqual(payload["data"]["selected_folder"], "junkemail")
+
+    @patch.object(app_module, "get_external_api_key", return_value="test-key")
+    @patch.object(app_module, "get_account_by_email", return_value=ACTIVE_ACCOUNT)
+    @patch.object(app_module, "get_emails_imap_generic", side_effect=AssertionError("get_emails_imap_generic should not be used for Graph accounts"))
+    @patch.object(app_module, "get_email_detail_imap_generic_result", side_effect=AssertionError("get_email_detail_imap_generic_result should not be used for Graph accounts"))
+    @patch.object(app_module, "read_account_messages", side_effect=mock_read_account_messages)
+    @patch.object(app_module, "read_account_message_detail", side_effect=mock_read_account_message_detail)
+    def test_external_route_keeps_graph_path_for_non_imap_account(
+        self,
+        _mock_detail,
+        _mock_messages,
+        _mock_imap_detail,
+        _mock_imap_messages,
+        _mock_account,
+        _mock_api_key,
+    ):
+        response = self.client.get(
+            "/api/external/verification-code?email=user@outlook.com",
+            headers={"X-API-Key": "test-key"},
+        )
+
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["data"]["code"], "654321")
+        self.assertEqual(payload["data"]["selected_folder"], "junkemail")
 
     def test_external_verification_code_uses_same_latest_message_logic_without_default_lookback(self):
         since_minutes_seen = []
