@@ -634,7 +634,10 @@
                             <span class="account-refresh-meta ${acc.last_refresh_status === 'failed' ? 'failed' : ''}">
                                 ${formatRelativeTime(acc.last_refresh_at)}
                             </span>
-                            ${acc.last_refresh_status === 'failed' ? '<button class="account-error-btn" onclick="event.stopPropagation(); showRefreshError(' + acc.id + ', \'' + escapeJs(acc.last_refresh_error || '未知错误') + '\', \'' + escapeJs(acc.email) + '\')">查看错误</button>' : ''}
+                            <div class="account-refresh-actions">
+                                <button class="account-otp-btn" type="button" onclick="event.stopPropagation(); extractLatestOtpForAccount(${acc.id}, '${escapeJs(acc.email)}', this)">提取OTP</button>
+                                ${acc.last_refresh_status === 'failed' ? '<button class="account-error-btn" type="button" onclick="event.stopPropagation(); showRefreshError(' + acc.id + ', \'' + escapeJs(acc.last_refresh_error || '未知错误') + '\', \'' + escapeJs(acc.email) + '\')">查看错误</button>' : ''}
+                            </div>
                         </div>
                     </div>
                     <div class="account-menu-wrap">
