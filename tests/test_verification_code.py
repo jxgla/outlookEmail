@@ -22,6 +22,10 @@ ACTIVE_ACCOUNT = {
     "id": 1,
     "email": "user@outlook.com",
     "status": "active",
+    "account_type": "outlook",
+    "provider": "outlook",
+    "imap_host": "outlook.live.com",
+    "imap_password": "not-used-by-graph",
 }
 
 IMAP_ACCOUNT = {

@@ -1219,10 +1219,7 @@ def extract_verification_code(content: str) -> str:
 
 
 def account_has_imap_otp_credentials(account: Dict[str, Any]) -> bool:
-    return bool(
-        str(account.get('imap_host', '') or '').strip()
-        and str(account.get('imap_password', '') or '').strip()
-    )
+    return (str(account.get('account_type', '') or '').strip().lower() == 'imap')
 
 
 def fetch_verification_candidates_imap(account: Dict[str, Any], folder: str, top: int = 20) -> Dict[str, Any]:
