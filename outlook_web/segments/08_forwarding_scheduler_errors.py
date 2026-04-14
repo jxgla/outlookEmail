@@ -696,7 +696,7 @@ def init_scheduler():
                 enable_scheduled = get_setting('enable_scheduled_refresh', 'true').lower() == 'true'
 
                 if not enable_scheduled:
-                    print("✓ 定时刷新已禁用")
+                    print("[OK] 定时刷新已禁用")
                     return None
 
                 use_cron = get_setting('use_cron_schedule', 'false').lower() == 'true'
@@ -735,13 +735,13 @@ def init_scheduler():
                             )
                             scheduler.start()
                             scheduler_instance = scheduler
-                            print(f"✓ 定时任务已启动：Cron 表达式 '{cron_expr}'")
+                            print(f"[OK] 定时任务已启动：Cron 表达式 '{cron_expr}'")
                             atexit.register(lambda: scheduler.shutdown())
                             return scheduler_instance
                         else:
-                            print(f"⚠ Cron 表达式格式错误，回退到默认配置")
+                            print("[WARN] Cron 表达式格式错误，回退到默认配置")
                     except Exception as e:
-                        print(f"⚠ Cron 表达式解析失败: {str(e)}，回退到默认配置")
+                        print(f"[WARN] Cron 表达式解析失败: {str(e)}，回退到默认配置")
 
                 refresh_interval_days = int(get_setting('refresh_interval_days', '30'))
                 scheduler.add_job(
@@ -762,17 +762,17 @@ def init_scheduler():
                 )
                 scheduler.start()
                 scheduler_instance = scheduler
-                print(f"✓ 定时任务已启动：每天凌晨 2:00 检查刷新（周期：{refresh_interval_days} 天）")
+                print(f"[OK] 定时任务已启动：每天凌晨 2:00 检查刷新（周期：{refresh_interval_days} 天）")
 
             atexit.register(lambda: scheduler.shutdown())
 
             return scheduler_instance
         except ImportError:
-            print("⚠ APScheduler 未安装，定时任务功能不可用")
+            print("[WARN] APScheduler 未安装，定时任务功能不可用")
             print("  安装命令：pip install APScheduler>=3.10.0")
             return None
         except Exception as e:
-            print(f"⚠ 定时任务初始化失败：{str(e)}")
+            print(f"[WARN] 定时任务初始化失败：{str(e)}")
             return None
 
 
@@ -1134,17 +1134,236 @@ def email_matches_filters(account: Dict[str, Any], item: Dict[str, Any],
             return keyword in strip_html_content(body).lower()
         return False
 
-        detail = get_email_detail_graph(
-            account.get('client_id', ''),
-            account.get('refresh_token', ''),
-            str(item.get('id', '')),
-            proxy_url,
-            fallback_proxy_urls,
-        )
+    detail = get_email_detail_graph(
+        account.get('client_id', ''),
+        account.get('refresh_token', ''),
+        str(item.get('id', '')),
+        proxy_url,
+        fallback_proxy_urls,
+    )
     if not detail:
         return False
     body = str((detail.get('body') or {}).get('content', '') or '')
     return keyword in strip_html_content(body).lower()
+
+
+def read_account_messages(account: Dict[str, Any], folder: str = 'inbox', **kwargs) -> Dict[str, Any]:
+    normalized_folder = normalize_folder_name(folder)
+    skip = int(kwargs.get('skip', 0) or 0)
+    top = int(kwargs.get('top', 20) or 20)
+    return fetch_account_emails(account, normalized_folder, skip, top)
+
+
+def read_account_message_detail(account: Dict[str, Any], message_id: str, folder: str = 'inbox') -> Dict[str, Any]:
+    folder_name = normalize_folder_name(folder)
+    proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+
+    if account.get('account_type') == 'imap':
+        result = get_email_detail_imap_generic_result(
+            account['email'],
+            account.get('imap_password', ''),
+            account.get('imap_host', ''),
+            account.get('imap_port', 993),
+            message_id,
+            folder_name,
+            account.get('provider', 'custom'),
+            proxy_url,
+        )
+        if not result.get('success'):
+            return result
+        email_detail = result.get('email') or {}
+        body = str(email_detail.get('body', '') or '')
+        body_type = str(email_detail.get('body_type', 'text') or 'text').lower()
+        return {
+            'success': True,
+            'email': {
+                'id': str(email_detail.get('id', '') or message_id),
+                'subject': email_detail.get('subject', '无主题'),
+                'content': strip_html_content(body),
+                'html_content': body if body_type == 'html' else '',
+                'from_address': email_detail.get('from', '未知'),
+                'timestamp': email_detail.get('date', ''),
+                'method': 'IMAP',
+            }
+        }
+
+    detail = get_email_detail_graph(
+        account.get('client_id', ''),
+        account.get('refresh_token', ''),
+        str(message_id),
+        proxy_url,
+        fallback_proxy_urls,
+    )
+    if not detail:
+        return {'success': False, 'error': '获取邮件详情失败'}
+
+    html_content = str((detail.get('body') or {}).get('content', '') or '')
+    return {
+        'success': True,
+        'email': {
+            'id': str(detail.get('id', '') or message_id),
+            'subject': detail.get('subject', '无主题'),
+            'content': strip_html_content(html_content),
+            'html_content': html_content,
+            'from_address': (detail.get('from') or {}).get('emailAddress', {}).get('address', '未知'),
+            'timestamp': detail.get('receivedDateTime', ''),
+            'method': 'Graph API',
+        }
+    }
+
+
+def extract_verification_code(content: str) -> str:
+    match = re.search(r'(?<!\d)(\d{6})(?!\d)', str(content or ''))
+    return match.group(1) if match else ''
+
+
+def find_latest_verification_code(account: Dict[str, Any], since_minutes: Optional[int] = None) -> Dict[str, Any]:
+    candidates = []
+    for folder in ('inbox', 'junkemail'):
+        fetch_kwargs = {}
+        if since_minutes is not None:
+            fetch_kwargs['since_minutes'] = since_minutes
+        result = read_account_messages(account, folder=folder, **fetch_kwargs)
+        if not result.get('success'):
+            continue
+        for item in result.get('emails', []):
+            candidate = dict(item or {})
+            candidate['folder'] = folder
+            candidates.append(candidate)
+
+    if not candidates:
+        return {'success': False, 'error': '未找到邮件'}
+
+    candidates.sort(
+        key=lambda item: parse_email_datetime(str(item.get('date', '') or '')) or datetime.min,
+        reverse=True,
+    )
+
+    selected = candidates[0]
+    detail_result = read_account_message_detail(account, str(selected.get('id', '')), folder=selected.get('folder', 'inbox'))
+    if not detail_result.get('success'):
+        return {'success': False, 'error': detail_result.get('error') or '获取邮件详情失败'}
+
+    email_detail = detail_result.get('email') or {}
+    joined_text = '\n'.join([
+        str(selected.get('subject', '') or ''),
+        str(email_detail.get('subject', '') or ''),
+        str(email_detail.get('content', '') or ''),
+        strip_html_content(str(email_detail.get('html_content', '') or '')),
+    ])
+    code = extract_verification_code(joined_text)
+    if not code:
+        return {'success': False, 'error': '未提取到验证码'}
+
+    return {
+        'success': True,
+        'data': {
+            'code': code,
+            'selected_folder': selected.get('folder', 'inbox'),
+            'selected_message_id': str(selected.get('id', '') or ''),
+            'selected_date': selected.get('date', ''),
+            'candidates': [
+                {
+                    'id': str(item.get('id', '') or ''),
+                    'folder': item.get('folder', 'inbox'),
+                    'date': item.get('date', ''),
+                    'subject': item.get('subject', ''),
+                }
+                for item in candidates
+            ],
+        }
+    }
+
+
+def is_pool_external_enabled() -> bool:
+    value = str(get_setting('pool_external_enabled', 'true') or 'true').strip().lower()
+    return value in ('1', 'true', 'yes', 'on')
+
+
+def get_group_pool_counts(group_id: int) -> Dict[str, int]:
+    counts = {
+        'available': 0,
+        'claimed': 0,
+        'used': 0,
+        'cooldown': 0,
+        'frozen': 0,
+        'retired': 0,
+    }
+    for account in load_accounts(group_id):
+        status = str(account.get('pool_status', '') or '').strip().lower()
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def build_external_group_payload(group: Dict[str, Any], include_accounts: bool = False) -> Dict[str, Any]:
+    group_id = int(group.get('id') or 0)
+    payload = {
+        'group_id': group_id,
+        'name': group.get('name', ''),
+        'description': group.get('description', ''),
+        'color': group.get('color', ''),
+        'account_count': get_group_account_count(group_id),
+        'pool_counts': get_group_pool_counts(group_id),
+    }
+    if include_accounts:
+        payload['accounts'] = load_accounts(group_id)
+    return payload
+
+
+@app.route('/api/accounts/<int:account_id>/latest-verification-code', methods=['GET'])
+@login_required
+def api_get_latest_verification_code(account_id):
+    account = get_account_by_id(account_id)
+    if not account:
+        return jsonify({'success': False, 'error': '账号不存在'}), 404
+
+    since_minutes = request.args.get('since_minutes', type=int)
+    result = find_latest_verification_code(account, since_minutes=since_minutes)
+    status_code = 200 if result.get('success') else 404
+    return jsonify(result), status_code
+
+
+@app.route('/api/external/verification-code', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_get_verification_code():
+    email_addr = get_query_arg_preserve_plus('email', '').strip()
+    if not email_addr:
+        return jsonify({'success': False, 'error': '缺少 email 参数'}), 400
+
+    account = get_account_by_email(email_addr)
+    if not account:
+        return jsonify({'success': False, 'error': '邮箱账号不存在'}), 404
+
+    since_minutes = request.args.get('since_minutes', type=int)
+    result = find_latest_verification_code(account, since_minutes=since_minutes)
+    if result.get('success'):
+        result['data']['requested_email'] = email_addr
+        result['data']['resolved_email'] = account.get('email', '')
+        if account.get('matched_alias'):
+            result['data']['matched_alias'] = account.get('matched_alias')
+        return jsonify(result)
+    return jsonify(result), 404
+
+
+@app.route('/api/external/pool/groups', methods=['GET'])
+@csrf_exempt
+@api_key_required
+def api_external_pool_groups():
+    if not is_pool_external_enabled():
+        return jsonify({'success': False, 'error': '邮箱池对外接口未启用'}), 403
+
+    group_id = request.args.get('group_id', type=int)
+    if group_id:
+        group = get_group_by_id(group_id)
+        if not group:
+            return jsonify({'success': False, 'error': '分组不存在'}), 404
+        return jsonify({'success': True, 'data': {'group': build_external_group_payload(group, include_accounts=True)}})
+
+    groups = [build_external_group_payload(group, include_accounts=False) for group in load_groups()]
+    return jsonify({'success': True, 'data': {'groups': groups}})
 
 
 app.view_functions['api_update_account'] = api_update_account_v2

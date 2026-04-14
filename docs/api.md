@@ -195,6 +195,121 @@ curl -H "X-API-Key: your-api-key" \
   - `partial: true`
   - `details` 中包含失败文件夹的错误信息
 
+### GET `/api/external/verification-code`
+
+从 `inbox + junkemail` 同时取信，按邮件时间选最新一封，并提取 6 位验证码。
+
+#### 查询参数
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `email` | string | 是 | 主邮箱或别名邮箱 |
+| `since_minutes` | int | 否 | 可选时间窗口；不传时默认不加 lookback 过滤 |
+
+#### 请求示例
+
+```bash
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/verification-code?email=user@outlook.com"
+```
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "data": {
+    "code": "654321",
+    "selected_folder": "junkemail",
+    "selected_message_id": "AAMk...",
+    "selected_date": "2026-04-10T10:00:00+00:00",
+    "requested_email": "user@outlook.com",
+    "resolved_email": "user@outlook.com",
+    "candidates": [
+      {
+        "id": "AAMk...",
+        "folder": "junkemail",
+        "date": "2026-04-10T10:00:00+00:00",
+        "subject": "Verification code"
+      }
+    ]
+  }
+}
+```
+
+### GET `/api/external/pool/groups`
+
+对外只读查询邮箱池分组。
+
+#### 查询参数
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `group_id` | int | 否 | 传入时返回单个分组详情并包含 `accounts`；不传返回分组摘要列表 |
+
+#### 请求示例
+
+```bash
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/pool/groups"
+
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/pool/groups?group_id=2"
+```
+
+#### 成功响应示例（摘要）
+
+```json
+{
+  "success": true,
+  "data": {
+    "groups": [
+      {
+        "group_id": 2,
+        "name": "注册组",
+        "description": "用于注册流程",
+        "color": "#123456",
+        "account_count": 2,
+        "pool_counts": {
+          "available": 1,
+          "claimed": 0,
+          "used": 0,
+          "cooldown": 0,
+          "frozen": 0,
+          "retired": 1
+        }
+      }
+    ]
+  }
+}
+```
+
+#### 成功响应示例（详情）
+
+```json
+{
+  "success": true,
+  "data": {
+    "group": {
+      "group_id": 2,
+      "name": "注册组",
+      "description": "用于注册流程",
+      "color": "#123456",
+      "account_count": 2,
+      "pool_counts": {
+        "available": 1,
+        "claimed": 0,
+        "used": 0,
+        "cooldown": 0,
+        "frozen": 0,
+        "retired": 1
+      },
+      "accounts": []
+    }
+  }
+}
+```
+
 ## 内部 API
 
 ## 分组管理
